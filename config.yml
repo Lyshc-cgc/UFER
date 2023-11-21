@@ -1,0 +1,17 @@
+lang: en
+batch_size: 8192  # specify batch size corresponding to your GPU memory
+num_workers: 8  # specify number of workers corresponding to your CPU cores
+in_dir: ./data/ultrafine_acl18/release/distant_supervision
+out_dir: ./data/ultrafine_acl18/stage1/distant_supervision
+
+# each stage has its own config, which can be fn_kwargs to be passed to the process function
+stage1:
+  min_len: 10
+  spacy_model:
+    # https://spacy.io/api/top-level#spacy.load
+    # for spacy.load function, we need to specify 'name'
+    name: en_core_web_trf  # for English, we can use en_core_web_sm, en_core_web_md, en_core_web_lg, en_core_web_trf
+  stanza_model:
+    # https://stanfordnlp.github.io/stanza/pipeline.html
+    lang: en  # for English
+    processors: tokenize, ner, pos, constituency  # specify processors, comma-seperated
