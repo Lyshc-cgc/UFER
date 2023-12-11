@@ -1,17 +1,39 @@
 lang: en
-batch_size: 8192  # specify batch size corresponding to your GPU memory
-num_workers: 8  # specify number of workers corresponding to your CPU cores
-in_dir: ./data/ultrafine_acl18/release/distant_supervision
-out_dir: ./data/ultrafine_acl18/stage1/distant_supervision
+batch_num_per_device: 200  # specify number of batches on each device to be processed in map function. Depends on your memory
+num_workers: 2  # specify number of workers corresponding to your CPU cores
+
+# if you have mulstiple (e.g., 4) GPUs, you can specify some of them(e.g. 0, 1, 2) or all of them (e.g., all)
+cuda_device: 0  # specify visible GPU device. If you have multiple GPUs, you can specify some of them (e.g. 0, 1, 2) or all of them (e.g., all)
 
 # each stage has its own config, which can be fn_kwargs to be passed to the process function
-stage1:
-  min_len: 10
+stage1:  # stage1 config
+  in_dir: ./data/edited_release/crowd  # input directory in stage1
+  out_dir: ./data/tmp/crowd  # output directory in stage1
+  sent_min_len: 15  # minimum length of sentence. Sentences with length less than min_len will be discarded
+  span_portion: 0.3  # The proportion of the longest span length to sentence length. To filter out long span.
+  batch_size_per_device: 32  #  Specify batch size per device corresponding to your GPU memory.
   spacy_model:
     # https://spacy.io/api/top-level#spacy.load
     # for spacy.load function, we need to specify 'name'
     name: en_core_web_trf  # for English, we can use en_core_web_sm, en_core_web_md, en_core_web_lg, en_core_web_trf
+    disable: # disable some components to speed up, https://spacy.io/usage/processing-pipelines#disabling
+      - tagger
+      - parser
+      - ner
+      - attribute_ruler
+      - lemmatizer
   stanza_model:
     # https://stanfordnlp.github.io/stanza/pipeline.html
     lang: en  # for English
     processors: tokenize, ner, pos, constituency  # specify processors, comma-seperated
+#    dir: /data1/gcchen/stanza_data  # default ~/stanza_resources
+
+    # tokenizer init
+    # https://stanfordnlp.github.io/stanza/tokenize.html#options
+    tokenize_pretokenized: True
+    tokenize_no_ssplit: True  # https://stanfordnlp.github.io/stanza/tokenize.html#tokenization-without-sentence-segmentation
+
+ontology:  # UFER ontology config
+    types:  # types file, which stores all types in UFER
+    types_def:  # type defition file, which stores all type definitions in UFER
+
