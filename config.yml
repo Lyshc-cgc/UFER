@@ -1,17 +1,33 @@
-lang: en
-batch_num_per_device: 200  # specify number of batches on each device to be processed in map function. Depends on your memory
-num_workers: 2  # specify number of workers corresponding to your CPU cores
+num_workers: 8  # specify number of workers corresponding to your CPU cores. Recommend be the number of your GPUs.
 
-# if you have mulstiple (e.g., 4) GPUs, you can specify some of them(e.g. 0, 1, 2) or all of them (e.g., all)
-cuda_device: 0  # specify visible GPU device. If you have multiple GPUs, you can specify some of them (e.g. 0, 1, 2) or all of them (e.g., all)
+# We can split large files into small shards to avoid memory overflow and boost process speed.
+# specify number of shards to be processed in map function. Depends on your memory.
+# If you don't want to split, you can set num_shards to 1.
+# the larger dataset you have, the larger num_shards you need.
+# Note that it must be multiples of num_worker. e.g., 1*num_workers, 2*num_workers
+num_shards: 8
+# if you have multiple (e.g., 4) GPUs, you can specify some of them(e.g. 0, 1, 2) or all of them (e.g., all)
+cuda_device: all  # specify visible GPU device. If you have multiple GPUs, you can specify some of them (e.g. 0, 1, 2) or all of them (e.g., all)
+data_dir: ./data  # data directory
+
+# pre-process config
+preprocess:
+  in_dirs:  # input directory in stage1
+    - ./data/edited_release/distant_supervision
+    - ./data/edited_release/crowd
+    - ./data/edited_release/ontonotes
+  out_dir: ./data/preprocessed
 
 # each stage has its own config, which can be fn_kwargs to be passed to the process function
 stage1:  # stage1 config
-  in_dir: ./data/edited_release/crowd  # input directory in stage1
-  out_dir: ./data/tmp/crowd  # output directory in stage1
+  # strict or loose. In strict mode, we get spans based on intersection of spaCy and Stanza results.
+  # In loose mode, we get spans based on union of spaCy and Stanza results.
+  mode: loose  # strict or loose
+  in_dir: ./data/preprocessed  # input directory in stage1, which are results from preprocess stage
   sent_min_len: 15  # minimum length of sentence. Sentences with length less than min_len will be discarded
   span_portion: 0.3  # The proportion of the longest span length to sentence length. To filter out long span.
-  batch_size_per_device: 32  #  Specify batch size per device corresponding to your GPU memory.
+  batch_num_per_device: 10  # Specify number of batches on each device to be processed in map function. Depends on your memory
+  batch_size_per_device: 1024  #  Specify batch size per device. Depends on your GPU memory.
   spacy_model:
     # https://spacy.io/api/top-level#spacy.load
     # for spacy.load function, we need to specify 'name'
@@ -26,7 +42,7 @@ stage1:  # stage1 config
     # https://stanfordnlp.github.io/stanza/pipeline.html
     lang: en  # for English
     processors: tokenize, ner, pos, constituency  # specify processors, comma-seperated
-#    dir: /data1/gcchen/stanza_data  # default ~/stanza_resources
+    # dir: /data1/gcchen/stanza_data  # default ~/stanza_resources
 
     # tokenizer init
     # https://stanfordnlp.github.io/stanza/tokenize.html#options

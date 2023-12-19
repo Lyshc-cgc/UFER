@@ -1,24 +1,25 @@
+import torch
 import spacy
 import stanza
 import os
 import yaml
 import multiprocess
-import torch
+import jsonlines
 from nltk.tree import Tree
-from datasets import load_dataset
+from datasets import load_dataset, concatenate_datasets
 from yaml.loader import SafeLoader
 from typing import List
+from tqdm import tqdm
 
 
 class Processor:
     def __init__(self, config_file):
         with open(config_file, 'r') as f:
             self.config = yaml.load(f, Loader=SafeLoader)
-        self.lang = self.config['lang']
-        assert self.lang == 'en', f'Language {self.lang} is not supported! Please use "en"'
         self.num_workers = self.config['num_workers']
-        self.batch_num_per_device = self.config['batch_num_per_device']
+        self.num_shards = self.config['num_shards']
         self.cuda_device = self.config['cuda_device']
+        self.data_dir = self.config['data_dir']
 
     @staticmethod
     def merge_compound_words(sents: List[List[str]]) -> List[str]:
@@ -50,7 +51,10 @@ class Processor:
                         pos += 2  # ignore this word
                     pos = pos - 1  # in this case, the position of the next new word is at the previous position
                 elif not word.endswith('B-') and word != '--' and word.endswith('-'):  # e.g., ['a', 'the', 'Semi-', 'finals', 'b'] -> ['a', 'the Semi-finals', 'b']
-                    if pos + 2 < len(sent):
+                    # Special symbols (e.g., '-LRB-', '-LSB-') need to be excluded
+                    if pos + 1 == len(sent):  # the last word
+                        break
+                    elif pos + 2 < len(sent):
                         sent = sent[:pos] + [''.join(sent[pos: pos + 2])] + sent[pos + 2:]
                     else:
                         sent = sent[:pos] + [''.join(sent[pos: pos + 2])]
@@ -71,11 +75,11 @@ class Processor:
     @staticmethod
     def modify_spacy_tokenizer(nlp):
         """
-        Modify the spacy tokenizer to prevent it from splitting on '-' and '/'.
+        Modify the spaCy tokenizer to prevent it from splitting on '-' and '/'.
         Refer to https://spacy.io/usage/linguistic-features#native-tokenizer-additions
 
-        :param nlp: The spacy model.
-        :return: The modified spacy model.
+        :param nlp: The spaCy model.
+        :return: The modified spaCy model.
         """
         from spacy.lang.char_classes import ALPHA, ALPHA_LOWER, ALPHA_UPPER
         from spacy.lang.char_classes import CONCAT_QUOTES, LIST_ELLIPSES, LIST_ICONS
@@ -120,60 +124,59 @@ class Processor:
     def stage1(self, instances, rank = 0, **kwargs):
         """
         Stage1, filter short sentences, get noun phrase (NP) spans and named entity (NE) spans in sentences. English only.
-        Please note that the number of instances passed in may not be enough to fill all batches. Therefore, it is necessary
-        to determine and exit in a timely manner.
+        In this stage, we get flat spans by spaCy. Meanwhile, we get nested spans by spaCy and Stanza.
 
         :param instances: A batch of instances.
         :param rank: The rank of the current process. It will be automatically assigned a value when multiprocess is
             enabled in the map function.
         :param kwargs:
-            1) sent_min_len: The number of words in the sentence to be processed must exceed sent_min_len. Default is 10.
-            2) span_portion: The proportion of the longest span length to sentence length. To filter out long span.
-            3) batch_size_per_device: Batch size processed in the model on each device.
-            4) spacy_model: The spacy parser config we use.
-            5) stanza_model: The stanza parser config we use.
+            1) mode: strict or loose. In strict (default) mode, we get spans based on intersection of spaCy and
+                Stanza results. If strict, the span text must be exactly the same as the text in the sentence.
+            2) sent_min_len: The number of words in the sentence to be processed must exceed sent_min_len. Default is 10.
+            3) span_portion: The proportion of the longest span length to sentence length. To filter out long span.
+            4) batch_num_per_device: # Specify number of batches on each device to be processed in map function. Depends on your memory.
+            5) batch_size_per_device: Batch size processed in the model on each device.
+            6) spacy_model: The spaCy parser config we use.
+            7) stanza_model: The stanza parser config we use.
         :return:
         """
+        assert kwargs['mode'] in ['strict', 'loose'], f"mode must be one of ('stric', loose)!"
         if self.cuda_device == 'all':
             # set the GPU can be used by stanza in this process
             os.environ["CUDA_VISIBLE_DEVICES"] = str(rank % torch.cuda.device_count())
 
-            # specify the GPU to be used by spacy, which should be same as above
+            # specify the GPU to be used by spaCy, which should be same as above
             spacy.prefer_gpu(rank % torch.cuda.device_count())
         else:
             cuda_devices = str(self.cuda_device).split(',')
             gpu_id = rank % len(cuda_devices)
             os.environ["CUDA_VISIBLE_DEVICES"] = str(cuda_devices[gpu_id])
 
-            # specify the GPU to be used by spacy, which should be same as above
+            # specify the GPU to be used by spaCy, which should be same as above
             spacy.prefer_gpu(int(cuda_devices[gpu_id]))
 
-        # load a spacy and a stanza model in each process
+        # load a spaCy and a stanza model in each process
         spacy_nlp = spacy.load(name = kwargs['spacy_model']['name'])
-        spacy_nlp = self.modify_spacy_tokenizer(spacy_nlp)  # modify the spacy tokenizer
+        spacy_nlp = self.modify_spacy_tokenizer(spacy_nlp)  # modify the spaCy tokenizer
         stanza_nlp = stanza.Pipeline(**kwargs['stanza_model'], download_method=None)
 
         sentences, out_sentences, out_spans = [], [], []
 
-        for idx in range(self.batch_num_per_device):
-            # 1. preprocess
-            # 1.1. get raw sentences
+        for idx in range(kwargs['batch_num_per_device']):
+            # 1. Some preparations
+            # 1.1. get batch sentences for the device in this process
             start_pos, end_pos = idx * kwargs['batch_size_per_device'], (idx + 1) * kwargs['batch_size_per_device']
-            left_context_tokens = instances['left_context_token'][start_pos : end_pos]
-            mention_spans = instances['mention_span'][start_pos : end_pos]
-            right_context_tokens = instances['right_context_token'][start_pos : end_pos]
-            raw_sents = [' '.join(lc + m.split(' ') + rc)
-                         for lc, m, rc in zip(left_context_tokens, mention_spans, right_context_tokens)]
+            raw_sents = instances['sentence'][start_pos: end_pos]
 
-            # tokenize the raw sentences using spacy
+            # 1.2. tokenize the raw sentences using spaCy
             # https://spacy.io/api/language#pipe
-            docs = list(spacy_nlp.pipe(raw_sents, disable = kwargs['spacy_model']['disable']))
+            docs = spacy_nlp.pipe(raw_sents, disable = kwargs['spacy_model']['disable'])
             batch_texts = [[token.text for token in doc] for doc in docs]
             batch_texts = list(filter(lambda x: len(x) >= kwargs['sent_min_len'], batch_texts))  # filter short sentences
             if len(batch_texts) <= 0:
                 continue
 
-            # 1.2. merge compound words
+            # 1.3. merge compound words
             # Some compound words formed by hyphen (-) had been split into several words,
             # we need to combine them back into a single word,
             # e.g., ['United', '-', 'States'] -> ['United-States']
@@ -181,7 +184,7 @@ class Processor:
             # e.g., ['3', '/', '4ths', 'to', '9' , '/', '10ths'] -> ['3/4ths', 'to', '9/10ths']
             batch_texts = self.merge_compound_words(batch_texts)
 
-            # 1.3. replace special tokens with original characters
+            # 1.4. replace special tokens with original characters
             batch_texts = [self.replace_special_tokens(sent) for sent in batch_texts]
 
             # 2. process by 2 parsers
@@ -190,29 +193,29 @@ class Processor:
             # 2) https://spacy.io/api/language#pipe
             spacy_docs = list(spacy_nlp.pipe(batch_texts))  # covert generator to list
 
-            # Here, spacy tokenizer will split some words into several tokens according to the rule,
+            # Here, spaCy tokenizer will split some words into several tokens according to the rule,
             # even if they are connected together
             # e.g., 'roll-on/roll-off' -> 'roll-on', '/', 'roll-off
-            # To ensure consistency of subsequent data, we use the text processed by spacy as input for stanza
+            # To ensure consistency of subsequent data, we use the text processed by spaCy as input for stanza
             # batch_texts = [' '.join([token.text for token in s_doc]) for s_doc in spacy_docs]
 
             # refer to https://stanfordnlp.github.io/stanza/getting_started.html#processing-multiple-documents
             stanza_docs = stanza_nlp.bulk_process(batch_texts)
 
             for sent, spa_doc, sta_doc in zip(batch_texts, spacy_docs, stanza_docs):
-                # 2.1 spacy
-                # 2.1.1 get NP spans by spacy
+                # 2.1 spaCy
+                # 2.1.1 get NP spans by spaCy. They are flat
                 # store the start word index, end word index (excluded) and the text of the NP spans.
                 # i.e., (start_word_idx, end_word_idx, span_text)
-                # The method is included in the spacy package.
+                # The method is included in the spaCy package.
                 # refer to https://spacy.io/usage/linguistic-features#noun-chunks
                 # and https://spacy.io/api/doc#noun_chunks
                 spacy_result = [(chunk.start, chunk.end, chunk.text) for chunk in spa_doc.noun_chunks]
 
-                # 2.1.2 get NE spans by spacy
+                # 2.1.2 get NE spans by spaCy. They are flat
                 # store the start word index, end word index (excluded) and the text of the NE spans.
                 # i.e., (start_word_idx, end_word_idx, span_text)
-                # The method is included in the spacy package.
+                # The method is included in the spaCy package.
                 # refer to https://spacy.io/usage/linguistic-features#named-entities
                 # and https://spacy.io/api/span
                 spacy_result += [(ent.start, ent.end, ent.text) for ent in spa_doc.ents]
@@ -221,7 +224,7 @@ class Processor:
                 # 2.2 stanza
                 # 2.2.1 get NP spans by stanza
                 # refer to https://stanfordnlp.github.io/stanza/constituency.html
-                # Here, Constituency parser of stanza will split compound words formed by hyphen (-) into several words
+                # Here, Constituency parser of Stanza will split compound words formed by hyphen (-) into several words
                 # e.g., 'United-States' will be split into 'United', '-' and 'States'
                 constituency_string = sta_doc.sentences[0].constituency  # constituency parse tree (String) of the sentence
 
@@ -270,7 +273,6 @@ class Processor:
                         # Find the start character index and end character index of the first matched NP/NE span.
                         match = sent.find(span_text)
                         if match == -1:  # no matched NP/NE span
-                            print(f'span:{span_text}\nraw_sent:{sent}\n')
                             continue
                         else:
                             start_ch_idx, end_ch_idx = match, match + len(span_text)
@@ -287,13 +289,21 @@ class Processor:
                 stanza_result = set(stanza_result)  # remove duplicates
 
                 # 2.3. Select the union of two parsers' recognition results (NP/NE spans)
-                # convert start/end index to string, to be consistent with the format of spans. This operation ensures that
-                # the tuple is successfully converted to pyarrow and then serialized into a JSON/JSONL array
+                # convert start/end index to string, to be consistent with the format of spans. This operation ensures
+                # that the tuple is successfully converted to pyarrow and then serialized into a JSON/JSONL array
                 max_span_len = kwargs['span_portion'] * len(sent)
-                spans = [(str(start), str(end), text)
-                         for start, end, text in list(spacy_result | stanza_result)
-                         if len(text) <= max_span_len  # filter out long span
-                        ]
+                if kwargs['mode'] == 'strict':
+                    # In strict (default) mode, we get spans based on intersection of spaCy and Stanza results.
+                    spans = [(str(start), str(end), text)
+                             for start, end, text in list(spacy_result & stanza_result)
+                             if len(text) <= max_span_len  # filter out long span
+                            ]
+                else:
+                    # In loose mode, we get spans based on union of spaCy and Stanza results.
+                    spans = [(str(start), str(end), text)
+                             for start, end, text in list(spacy_result | stanza_result)
+                             if len(text) <= max_span_len  # filter out long span
+                            ]
                 if len(spans) > 0:  # filter out empty np_span
                     out_sentences.append(sent)
                     out_spans.append(spans)
@@ -302,6 +312,50 @@ class Processor:
             'sentence': out_sentences,
             'span': out_spans,
         }
+
+    def pre_process(self):
+        """
+        Pre-process the data, including:
+            1) get raw sentences (sentence only).
+            2) remove duplicates.
+            3) merge all datasets into a single file
+        :return:
+        """
+        print("="*20 + " Pre-processing " + "="*20)
+
+        # 1. init
+        preprocess_cfg = self.config['preprocess']
+        in_dirs = preprocess_cfg['in_dirs']
+        out_dir = preprocess_cfg['out_dir']
+        if not os.path.exists(out_dir):
+            os.makedirs(out_dir)
+        out_file = os.path.join(out_dir, 'datasets.json')
+        if os.path.exists(out_file):
+            print(f'{out_file} already exists!')
+            return
+
+        # 2. start pre-processing
+        unique_sents = set()
+        with jsonlines.open(out_file, 'w') as writer:
+            for in_dir in in_dirs:
+                for path, dir_lst, file_lst in os.walk(in_dir):
+                    for file_name in file_lst:
+                        assert file_name.endswith('.json') or file_name.endswith('.jsonl'), \
+                            f'File format not supported. Only json and jsonl are supported.'
+
+                        in_file = os.path.join(path, file_name)
+                        print(f'Pre-processing {in_file}, output to {out_file}')
+                        # get raw sentences and remove duplicates
+                        with jsonlines.open(in_file) as reader:
+                            for obj in tqdm(reader, desc='reading'):
+                                left_context_token = obj['left_context_token']
+                                mention_span = obj['mention_span']
+                                right_context_token = obj['right_context_token']
+                                raw_sent = ' '.join(left_context_token + mention_span.split(' ') + right_context_token)
+                                unique_sents.add(raw_sent)
+            for sent in tqdm(unique_sents, desc='writing'):
+                writer.write({'sentence': sent})
+        print("=" * 20 + " Pre-processing Done " + "=" * 20)
 
     def process(self, stage):
         """
@@ -317,7 +371,8 @@ class Processor:
         # 1. init stage config to get fn_kwargs
         stage_cfg = self.config[stage]
         in_dir = stage_cfg['in_dir']
-        out_dir = stage_cfg['out_dir']
+        out_dir = os.path.join(self.data_dir, stage)
+        out_dir = os.path.join(out_dir, stage_cfg['mode'])
         if not os.path.exists(out_dir):
             os.makedirs(out_dir)
 
@@ -325,35 +380,57 @@ class Processor:
             process_func = self.stage1 # Specify the function to be used in the given stage.
 
         # 2. process each file in the given directory
-        for _, dir_lst, file_lst in os.walk(in_dir):
+        for path, dir_lst, file_lst in os.walk(in_dir):
             for file_name in file_lst:
                 assert file_name.endswith('.json') or file_name.endswith('.jsonl'), \
                     f'File format not supported. Only json and jsonl are supported.'
 
-                in_file = os.path.join(in_dir, file_name)
+                # 2.1. get input and output file path
+                in_file = os.path.join(path, file_name)
                 out_file = os.path.join(out_dir, file_name)
 
+                # https://huggingface.co/docs/datasets/v2.15.0/en/package_reference/main_classes#datasets.Dataset.shard
                 # A dataset without a loading script by default loads all the data into the train split
+                # So we need to specify the 'train' split to process it.
+                # refer to https://huggingface.co/docs/datasets/loading#hugging-face-hub
                 dataset = load_dataset('json', data_files=in_file)
-                dataset = dataset.map(process_func,
-                                      fn_kwargs = stage_cfg,  # kwargs for process_func
-                                      batched = True,
-                                      with_rank = True,
-                                      batch_size = stage_cfg['batch_size_per_device'] * self.batch_num_per_device,
-                                      num_proc = self.num_workers,
-                                      remove_columns = dataset['train'].column_names,  # Remove unnecessary columns from the original dataset
-                                      )
+                dataset = dataset['train']
+
+                # 2.2. shard the large dataset into num_shards pieces, and process one piece at a time
+                processed_datasets = []
+                for idx in range(self.num_shards):
+                    print("="*20  + f'Processing shard {idx+1}/{self.num_shards} ' + "="*20)
+                    sub_dataset = dataset.shard(num_shards = self.num_shards, index = idx, contiguous=True)
+
+                    # 2.3. process the dataset
+                    # https://huggingface.co/docs/datasets/process#map
+                    # https://huggingface.co/docs/datasets/v2.15.0/en/package_reference/main_classes#datasets.Dataset.map
+                    sub_dataset = sub_dataset.map(process_func,
+                                          fn_kwargs = stage_cfg,  # kwargs for process_func
+                                          batched = True,
+                                          with_rank = True,
+                                          batch_size = stage_cfg['batch_size_per_device'] * stage_cfg['batch_num_per_device'],
+                                          num_proc = self.num_workers,
+                                          remove_columns = dataset.column_names,  # Remove unnecessary columns from the original dataset
+                                          )
+                    processed_datasets.append(sub_dataset)
 
                 # 3. save the processed dataset
-                # A dataset without a loading script by default loads all the data into the train split.
-                # So we need to specify the 'train' split to be saved.
-                # refer to https://huggingface.co/docs/datasets/loading#hugging-face-hub
-                dataset['train'].to_json(out_file)
+                dataset = concatenate_datasets(processed_datasets)  # merge all shards into a single dataset
+                dataset.to_json(out_file)
+
+    def statistic(self):
+        """
+        statistic dataset information.
+        :return:
+        """
+        pass
 
 def main():
     config_file = r'config.yml'
     processor = Processor(config_file)
-    processor.process('stage1')
+    processor.pre_process()  # pre-process the data
+    processor.process('stage1')  # stage1, filter short sentences, get NP spans and NE spans in sentences. English only.
 
 if __name__ == '__main__':
     main()

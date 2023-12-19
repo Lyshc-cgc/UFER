@@ -1,6 +1,10 @@
 # Edited Release
 
-The 'edited_release' folder contains the data edited from [**the Original data**](https://www.cs.utexas.edu/~eunsol/html_pages/open_entity.html).
+The 'edited_release' folder contains the data edited from [**the Original data**](https://www.cs.utexas.edu/~eunsol/html_pages/open_entity.html). 
+
+1. We manually checked and replaced the uninterrupted spaces (i.e., \u00A0) within the original data with hyphens. 
+2. We add more detailed explanations for each file.
+3. We manually deleted some incomprehensible instances.
 
 >Original Paper: [Choi E, Levy O, Choi Y, et al. Ultra-Fine Entity Typing[C]//Proceedings of the 56th Annual Meeting of the Association for Computational Linguistics (Volume 1: Long Papers). 2018: 87-96.](https://arxiv.org/abs/1807.04905)  
 
