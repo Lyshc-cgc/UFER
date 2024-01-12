@@ -10,6 +10,20 @@ num_shards: 8
 cuda_device: all  # specify visible GPU device. If you have multiple GPUs, you can specify some of them (e.g. 0, 1, 2) or all of them (e.g., all)
 data_dir: ./data  # data directory
 
+type_cfg:  # UFER type config
+  type_vocab: ./data/ufer_types/type_vocab.txt  # type vocabulary file, which stores all the type words in UFER
+  type_info_file: ./data/ufer_types/test_type_info.jsonl  # type information file, which stores information of all the types in UFER
+
+  # dictionary api, which is used to get professional information for type words
+  # we use a free dictionary api {https://github.com/meetDeveloper/freeDictionaryAPI}
+  api_url: https://api.dictionaryapi.dev/api/v2/entries/  # API URL of the free Dictionary API
+  lang_type: en  # language type of the dictionary you want, 'en' for English dictionary
+
+  # wikipedia api config, which is used to get wikipedia information for type words
+  # see https://wikipedia.readthedocs.io/en/latest/quickstart.html for more details
+  sentences: 2  # number of sentences to be extracted from Wikipedia Encyclopedia
+  auto_suggest: False  # whether to automatically search for alternative suggestions if the query word is not found. Default is False.
+
 # pre-process config
 preprocess:
   in_dirs:  # input directory in stage1
@@ -48,8 +62,4 @@ stage1:  # stage1 config
     # https://stanfordnlp.github.io/stanza/tokenize.html#options
     tokenize_pretokenized: True
     tokenize_no_ssplit: True  # https://stanfordnlp.github.io/stanza/tokenize.html#tokenization-without-sentence-segmentation
-
-ontology:  # UFER ontology config
-    types:  # types file, which stores all types in UFER
-    types_def:  # type defition file, which stores all type definitions in UFER
 

@@ -5,14 +5,22 @@ import os
 import yaml
 import multiprocess
 import jsonlines
+
 from nltk.tree import Tree
 from datasets import load_dataset, concatenate_datasets
 from yaml.loader import SafeLoader
-from typing import List
+from typing import List, Sequence, Dict
 from tqdm import tqdm
+from util.definition import get_type_word, TypeWord
 
 
 class Processor:
+    """
+    Class Processor used to process the UFER dataset including:
+        1) get type information
+        2) pre-process the dataset
+        3) process the dataset in each stage
+    """
     def __init__(self, config_file):
         with open(config_file, 'r') as f:
             self.config = yaml.load(f, Loader=SafeLoader)
@@ -20,6 +28,9 @@ class Processor:
         self.num_shards = self.config['num_shards']
         self.cuda_device = self.config['cuda_device']
         self.data_dir = self.config['data_dir']
+
+        # store type information
+        self.type_info = dict()
 
     @staticmethod
     def merge_compound_words(sents: List[List[str]]) -> List[str]:
@@ -120,6 +131,102 @@ class Processor:
                            )
 
         return processed_sents
+
+    def build_type_info(self):
+        """
+        Build type information of the UFER dataset.
+        The result will be stored in the type_info_file.
+        For those words that cannot be found in the dictionary api and Wikipedia, we use 'None' as their definitions.
+        We should manually search the definitions of those words from other sources and update manually the type_info_file.
+        """
+        print("=" * 20 + " Building type information of the UFER dataset " + "=" * 20)
+        type_cfg = self.config['type_cfg']
+        type_vocab = type_cfg['type_vocab']
+        type_info_file = type_cfg['type_info_file']
+
+        # Due to some reason, the build process stop.
+        # We can skip those type words whose information have been build.
+        # If start_id = 0, we still can bulid type information of the UFER dataset from scratch
+        start_id = 0
+        if os.path.exists(type_info_file):
+            with open(type_info_file, 'r') as reader:
+                lines = reader.readlines()
+                start_id = len(lines)
+                print(f'{start_id} type words have been gotten. We continue build process from the {start_id}-th type word')
+
+        with open(type_vocab, 'r') as reader, jsonlines.open(type_info_file, 'a') as writer:
+            for idx, line in enumerate(tqdm(reader.readlines(), desc='building type info...')):
+                if idx < start_id:  # Skip type information that has been established
+                    continue
+                word = line.strip()
+                type_word_obj = get_type_word(word, idx, **type_cfg)
+                writer.write(type_word_obj.__dict__)
+        print("Building type information of the UFER dataset Done!")
+
+    def get_type_info(self):
+        """
+        Get type information of the UFER dataset from the type_info_file.
+        """
+        type_cfg = self.config['type_cfg']
+
+        self.type_info['type_num'] = 0  # total number of type words
+        self.type_info['type_vocab'] = []  # a list to store type words, just their literal values
+        self.type_info['type_words_dict'] = dict()  # # a dict to store all type information. key: type word, value: TypeWord object
+        self.type_info['type_words_list'] = []  # a Sequence to store all type information. Each element is a TypeWord object
+        with jsonlines.open(type_cfg['type_info_file'],'r') as reader:
+            for line in tqdm(reader, desc='get type info...'):
+                type_word_obj = TypeWord(**line)
+                type_word = line['word']
+                self.type_info['type_num'] += 1
+                self.type_info['type_vocab'].append(type_word)
+                self.type_info['type_words_dict'].update({type_word: type_word_obj})
+                self.type_info['type_words_list'].append(type_word_obj)
+        print('Get type information done!')
+
+
+    def pre_process(self):
+        """
+        Pre-process the data, including:
+            1) get raw sentences (sentence only).
+            2) remove duplicates.
+            3) merge all datasets into a single file
+        :return:
+        """
+        print("="*20 + " Pre-processing " + "="*20)
+
+        # 1. init
+        preprocess_cfg = self.config['preprocess']
+        in_dirs = preprocess_cfg['in_dirs']
+        out_dir = preprocess_cfg['out_dir']
+        if not os.path.exists(out_dir):
+            os.makedirs(out_dir)
+        out_file = os.path.join(out_dir, 'datasets.json')
+        if os.path.exists(out_file):
+            print(f'{out_file} already exists!')
+            return
+
+        # 2. start pre-processing
+        unique_sents = set()
+        with jsonlines.open(out_file, 'w') as writer:
+            for in_dir in in_dirs:
+                for path, dir_lst, file_lst in os.walk(in_dir):
+                    for file_name in file_lst:
+                        assert file_name.endswith('.json') or file_name.endswith('.jsonl'), \
+                            f'File format not supported. Only json and jsonl are supported.'
+
+                        in_file = os.path.join(path, file_name)
+                        print(f'Pre-processing {in_file}, output to {out_file}')
+                        # get raw sentences and remove duplicates
+                        with jsonlines.open(in_file) as reader:
+                            for obj in tqdm(reader, desc='reading'):
+                                left_context_token = obj['left_context_token']
+                                mention_span = obj['mention_span']
+                                right_context_token = obj['right_context_token']
+                                raw_sent = ' '.join(left_context_token + mention_span.split(' ') + right_context_token)
+                                unique_sents.add(raw_sent)
+            for sent in tqdm(unique_sents, desc='writing'):
+                writer.write({'sentence': sent})
+        print("=" * 20 + " Pre-processing Done " + "=" * 20)
 
     def stage1(self, instances, rank = 0, **kwargs):
         """
@@ -313,50 +420,6 @@ class Processor:
             'span': out_spans,
         }
 
-    def pre_process(self):
-        """
-        Pre-process the data, including:
-            1) get raw sentences (sentence only).
-            2) remove duplicates.
-            3) merge all datasets into a single file
-        :return:
-        """
-        print("="*20 + " Pre-processing " + "="*20)
-
-        # 1. init
-        preprocess_cfg = self.config['preprocess']
-        in_dirs = preprocess_cfg['in_dirs']
-        out_dir = preprocess_cfg['out_dir']
-        if not os.path.exists(out_dir):
-            os.makedirs(out_dir)
-        out_file = os.path.join(out_dir, 'datasets.json')
-        if os.path.exists(out_file):
-            print(f'{out_file} already exists!')
-            return
-
-        # 2. start pre-processing
-        unique_sents = set()
-        with jsonlines.open(out_file, 'w') as writer:
-            for in_dir in in_dirs:
-                for path, dir_lst, file_lst in os.walk(in_dir):
-                    for file_name in file_lst:
-                        assert file_name.endswith('.json') or file_name.endswith('.jsonl'), \
-                            f'File format not supported. Only json and jsonl are supported.'
-
-                        in_file = os.path.join(path, file_name)
-                        print(f'Pre-processing {in_file}, output to {out_file}')
-                        # get raw sentences and remove duplicates
-                        with jsonlines.open(in_file) as reader:
-                            for obj in tqdm(reader, desc='reading'):
-                                left_context_token = obj['left_context_token']
-                                mention_span = obj['mention_span']
-                                right_context_token = obj['right_context_token']
-                                raw_sent = ' '.join(left_context_token + mention_span.split(' ') + right_context_token)
-                                unique_sents.add(raw_sent)
-            for sent in tqdm(unique_sents, desc='writing'):
-                writer.write({'sentence': sent})
-        print("=" * 20 + " Pre-processing Done " + "=" * 20)
-
     def process(self, stage):
         """
         Process the data in the given stage.
@@ -366,6 +429,7 @@ class Processor:
         """
         # set 'spawn' start method in the main process
         # refer to https://huggingface.co/docs/datasets/process#map
+        print("=" * 20 + f" Processing f{stage} " + "=" * 20)
         multiprocess.set_start_method('spawn')
 
         # 1. init stage config to get fn_kwargs
@@ -388,6 +452,9 @@ class Processor:
                 # 2.1. get input and output file path
                 in_file = os.path.join(path, file_name)
                 out_file = os.path.join(out_dir, file_name)
+                if os.path.exists(out_file):
+                    print(f'{out_file} already exists!')
+                    continue
 
                 # https://huggingface.co/docs/datasets/v2.15.0/en/package_reference/main_classes#datasets.Dataset.shard
                 # A dataset without a loading script by default loads all the data into the train split
@@ -429,8 +496,10 @@ class Processor:
 def main():
     config_file = r'config.yml'
     processor = Processor(config_file)
-    processor.pre_process()  # pre-process the data
-    processor.process('stage1')  # stage1, filter short sentences, get NP spans and NE spans in sentences. English only.
+    processor.build_type_info()  # 1. bulid type information first
+    processor.get_type_info()  # 2. then, get type information
+    # processor.pre_process()  # 3. pre-process the data
+    # processor.process('stage1')  # 4. stage1, filter short sentences, get NP spans and NE spans in sentences. English only.
 
 if __name__ == '__main__':
     main()
