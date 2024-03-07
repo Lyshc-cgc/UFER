@@ -9,9 +9,9 @@ import jsonlines
 from nltk.tree import Tree
 from datasets import load_dataset, concatenate_datasets
 from yaml.loader import SafeLoader
-from typing import List, Sequence, Dict
+from typing import List
 from tqdm import tqdm
-from util.definition import get_type_word, TypeWord
+from util.type_util import get_type_word, del_none, disambiguate_type_word, TypeWord
 
 
 class Processor:
@@ -26,14 +26,14 @@ class Processor:
             self.config = yaml.load(f, Loader=SafeLoader)
         self.num_workers = self.config['num_workers']
         self.num_shards = self.config['num_shards']
-        self.cuda_device = self.config['cuda_device']
+        self.cuda_devices = self.config['cuda_devices']
         self.data_dir = self.config['data_dir']
 
         # store type information
         self.type_info = dict()
 
     @staticmethod
-    def merge_compound_words(sents: List[List[str]]) -> List[str]:
+    def __merge_compound_words(sents: List[List[str]]) -> List[str]:
         """
         1. Some compound words formed by hyphen ('-') had been split into several words, we need to merge them into a
             single word.
@@ -84,7 +84,7 @@ class Processor:
         return list(set(new_sents))  # remove duplicates
 
     @staticmethod
-    def modify_spacy_tokenizer(nlp):
+    def __modify_spacy_tokenizer(nlp):
         """
         Modify the spaCy tokenizer to prevent it from splitting on '-' and '/'.
         Refer to https://spacy.io/usage/linguistic-features#native-tokenizer-additions
@@ -106,7 +106,7 @@ class Processor:
                     # r"(?<=[{a}])(?:{h})(?=[{a}])".format(a=ALPHA, h=HYPHENS),
                     r"(?<=[{a}]),(?=[{a}])".format(a=ALPHA),
                     # r"(?<=[{a}0-9])[:<>=/](?=[{a}])".format(a=ALPHA),
-                    r"(?<=[{a}])[:<>=/](?=[{a}])".format(a=ALPHA),  # Modified regex to not split words on '/' if it is preceded by a number
+                    r"(?<=[{a}])[:<>=/](?=[{a}])".format(a=ALPHA),  # Modified regex to only split words on '/' if it is preceded by a character
                 ]
         )
         infix_re = spacy.util.compile_infix_regex(infixes)
@@ -114,7 +114,7 @@ class Processor:
         return nlp
 
     @staticmethod
-    def replace_special_tokens(sent: str) -> str:
+    def __replace_special_tokens(sent: str) -> str:
         """
         Replace special tokens with original characters.
         e.g., '-LRB-' -> '(', '-RRB-' -> ')', '-LSB-' -> '[', '-RSB-' -> ']'
@@ -132,36 +132,85 @@ class Processor:
 
         return processed_sents
 
-    def build_type_info(self):
+    def build_type_info(self, cache_stage=0):
         """
-        Build type information of the UFER dataset.
-        The result will be stored in the type_info_file.
-        For those words that cannot be found in the dictionary api and Wikipedia, we use 'None' as their definitions.
-        We should manually search the definitions of those words from other sources and update manually the type_info_file.
+        To build type information of the UFER dataset, we need to do 4 things.
+
+        First, get type word (including its definition) according to the original type vocabulary. The result will be stored in the 'cache_info.jsonl' file.
+
+        Second, we should manually :
+            1) (carefully) For those words that cannot be found in the dictionary api and Wikipedia,
+                we need to search the definitions of those words from other sources and  update the 'cache_info.jsonl' file.
+                Some words may not have a suitable definition, and we label their definitions as 'None'.
+            2) (roughly) Check for words that is not suitable as a category, and we label their definitions as 'None'.
+            3) (roughly) Check for redundant words (i.e., words with similar definition already exist), and we label
+                redundant words' definitions as 'None'.
+
+        Third, remove the words with the definition 'None'.
+
+        Forth, remove similar meanings using Clustering and LLMs.
+        :param cache_stage: The stage of the cache file. We use this param to control the building process.
+            1) 0: no cache file, we should build from scratch;
+            2) 1: cache file with 'None' removed, skip the first step;
+            3) 2: cache file after meaning disambiguation, skip the first two steps.
         """
-        print("=" * 20 + " Building type information of the UFER dataset " + "=" * 20)
+        assert cache_stage in [0, 1, 2], f"cache_stage must be one of (0, 1, 2)!"
         type_cfg = self.config['type_cfg']
-        type_vocab = type_cfg['type_vocab']
-        type_info_file = type_cfg['type_info_file']
+        original_type_vocab = type_cfg['original_type_vocab']
+        type_info_dir = os.path.dirname(original_type_vocab)
 
-        # Due to some reason, the build process stop.
-        # We can skip those type words whose information have been build.
-        # If start_id = 0, we still can bulid type information of the UFER dataset from scratch
-        start_id = 0
-        if os.path.exists(type_info_file):
-            with open(type_info_file, 'r') as reader:
-                lines = reader.readlines()
-                start_id = len(lines)
-                print(f'{start_id} type words have been gotten. We continue build process from the {start_id}-th type word')
+        # 1. First, get type word (including its definition) according to the original type vocabulary
+        cache_info_file_0 = os.path.join(type_info_dir, '0_cache_none_type_info.jsonl')
+        if cache_stage == 0:
+            print("=" * 20 + " Building type information of the UFER dataset " + "=" * 20)
 
-        with open(type_vocab, 'r') as reader, jsonlines.open(type_info_file, 'a') as writer:
-            for idx, line in enumerate(tqdm(reader.readlines(), desc='building type info...')):
-                if idx < start_id:  # Skip type information that has been established
-                    continue
-                word = line.strip()
-                type_word_obj = get_type_word(word, idx, **type_cfg)
-                writer.write(type_word_obj.__dict__)
-        print("Building type information of the UFER dataset Done!")
+            # Due to some reason (network or request limit), the build process stop.
+            # We can skip those type words whose information have been build and continue from the next new type word.
+            # If start_id = 0, we still can build type information of the UFER dataset from scratch
+            start_id = 0
+            if os.path.exists(cache_info_file_0):
+                with open(cache_info_file_0, 'r') as reader:
+                    lines = reader.readlines()
+                    start_id = len(lines)
+                    print(f'{start_id} type words have been gotten. We continue build process from the {start_id+1}-th type word')
+
+            with open(original_type_vocab, 'r') as reader, jsonlines.open(cache_info_file_0, 'a') as writer:
+                for idx, line in enumerate(tqdm(reader.readlines(), desc='building type info...')):
+                    if idx < start_id:  # Skip type information that has been established
+                        continue
+                    word = line.strip()
+                    type_word_obj = get_type_word(word, idx, **type_cfg)
+                    writer.write(type_word_obj.__dict__)
+            cache_stage += 1
+
+        # 2. Second, do some manual work on the cache info file.
+        # 2.1 (carefully)
+        # For those words that cannot be found in the dictionary api and Wikipedia,
+        # we need to search the definitions of those words from other sources and  update the 'cache_info.jsonl' file.
+        # Some words may not have a suitable definition, and we label their definitions as 'None'.
+        # 2.2 (roughly)
+        # Check for words that is not suitable as a category, and we label their definitions as 'None'.
+        # 2.3 (roughly)
+        # Check for redundant words (i.e., words with similar definition already exist),
+        # and we label redundant words' definitions as 'None'.
+        # ...
+
+        cache_info_file_1 = os.path.join(type_info_dir, '1_cache_no_none_type_info.jsonl')
+        if cache_stage == 1:
+            # 3. Third, remove the words with the definition 'None'.
+            print("Remove the words with the definition 'None'.")
+            del_none(in_file=cache_info_file_0, out_file=cache_info_file_1)
+            cache_stage += 1
+
+        cache_info_file_2 = os.path.join(type_info_dir, '2_cache_disambiguation_type_info.jsonl')
+        if cache_stage == 2:
+            # 4. Forth, remove similar meanings using Clustering and LLMs.
+            print("Remove similar meanings using Clustering and LLMs.")
+            disambiguate_type_word(in_file=cache_info_file_1,
+                                   out_file=cache_info_file_2,
+                                   cuda_devices= self.cuda_devices,
+                                   **type_cfg)
+            print("Building type information of the UFER dataset Done!")
 
     def get_type_info(self):
         """
@@ -248,14 +297,15 @@ class Processor:
         :return:
         """
         assert kwargs['mode'] in ['strict', 'loose'], f"mode must be one of ('stric', loose)!"
-        if self.cuda_device == 'all':
+        if self.cuda_devices == 'all':
             # set the GPU can be used by stanza in this process
             os.environ["CUDA_VISIBLE_DEVICES"] = str(rank % torch.cuda.device_count())
 
             # specify the GPU to be used by spaCy, which should be same as above
+            # https://spacy.io/api/top-level#spacy.prefer_gpu
             spacy.prefer_gpu(rank % torch.cuda.device_count())
         else:
-            cuda_devices = str(self.cuda_device).split(',')
+            cuda_devices = str(self.cuda_devices).split(',')
             gpu_id = rank % len(cuda_devices)
             os.environ["CUDA_VISIBLE_DEVICES"] = str(cuda_devices[gpu_id])
 
@@ -264,7 +314,7 @@ class Processor:
 
         # load a spaCy and a stanza model in each process
         spacy_nlp = spacy.load(name = kwargs['spacy_model']['name'])
-        spacy_nlp = self.modify_spacy_tokenizer(spacy_nlp)  # modify the spaCy tokenizer
+        spacy_nlp = self.__modify_spacy_tokenizer(spacy_nlp)  # modify the spaCy tokenizer
         stanza_nlp = stanza.Pipeline(**kwargs['stanza_model'], download_method=None)
 
         sentences, out_sentences, out_spans = [], [], []
@@ -289,10 +339,10 @@ class Processor:
             # e.g., ['United', '-', 'States'] -> ['United-States']
             # Also, some fractions or ratio will be separated by spaces, we need to merge them together.
             # e.g., ['3', '/', '4ths', 'to', '9' , '/', '10ths'] -> ['3/4ths', 'to', '9/10ths']
-            batch_texts = self.merge_compound_words(batch_texts)
+            batch_texts = self.__merge_compound_words(batch_texts)
 
             # 1.4. replace special tokens with original characters
-            batch_texts = [self.replace_special_tokens(sent) for sent in batch_texts]
+            batch_texts = [self.__replace_special_tokens(sent) for sent in batch_texts]
 
             # 2. process by 2 parsers
             # refer to
@@ -351,7 +401,7 @@ class Processor:
                 # However, as mentioned before, the compound words formed by hyphen (-) will be split into several
                 # words by stanza. So we need to combine them back into a single word.
                 # e.g., ['United', '-', 'States'] -> ['United-States']
-                new_subtrees = self.merge_compound_words(subtrees)
+                new_subtrees = self.__merge_compound_words(subtrees)
 
                 # We initiate the start character index and end character index with -1.
                 # And the data format is a dict, where the key is the text of the NP span (to remove duplicates),
@@ -374,7 +424,7 @@ class Processor:
                     # stanza will replace some special characters with special tokens, e.g., '(' -> '-LRB-', '[' -> '-LSB-'
                     # We need to replace them back to the original characters.
                     # But we need to use escape character in the regular expression.
-                    span_text = self.replace_special_tokens(span_text)
+                    span_text = self.__replace_special_tokens(span_text)
 
                     if start_ch_idx == -1 and end_ch_idx == -1:  # -1 means the start/end character index is not available
                         # Find the start character index and end character index of the first matched NP/NE span.
@@ -496,7 +546,7 @@ class Processor:
 def main():
     config_file = r'config.yml'
     processor = Processor(config_file)
-    processor.build_type_info()  # 1. bulid type information first
+    processor.build_type_info(cache_stage=2)  # 1. build type information first
     processor.get_type_info()  # 2. then, get type information
     # processor.pre_process()  # 3. pre-process the data
     # processor.process('stage1')  # 4. stage1, filter short sentences, get NP spans and NE spans in sentences. English only.

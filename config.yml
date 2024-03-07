@@ -7,22 +7,82 @@ num_workers: 8  # specify number of workers corresponding to your CPU cores. Rec
 # Note that it must be multiples of num_worker. e.g., 1*num_workers, 2*num_workers
 num_shards: 8
 # if you have multiple (e.g., 4) GPUs, you can specify some of them(e.g. 0, 1, 2) or all of them (e.g., all)
-cuda_device: all  # specify visible GPU device. If you have multiple GPUs, you can specify some of them (e.g. 0, 1, 2) or all of them (e.g., all)
+cuda_devices: all  # specify visible GPU device. If you have multiple GPUs, you can specify some of them (e.g. 0, 1, 2) or all of them (e.g., all)
 data_dir: ./data  # data directory
 
 type_cfg:  # UFER type config
-  type_vocab: ./data/ufer_types/type_vocab.txt  # type vocabulary file, which stores all the type words in UFER
-  type_info_file: ./data/ufer_types/test_type_info.jsonl  # type information file, which stores information of all the types in UFER
+  original_type_vocab: ./data/ufer_types/original_type_vocab.txt  # original type vocabulary file, which stores original type words in UFER
+  type_vocab: ./data/ufer_types/type_vocab.txt  # type vocabulary file, which stores all the output type words in UFER
+  type_info_file: ./data/ufer_types/type_info.jsonl  # type information file, which stores information of all the types in UFER
 
-  # dictionary api, which is used to get professional information for type words
+  # 1. dictionary api, which is used to get professional information for type words
   # we use a free dictionary api {https://github.com/meetDeveloper/freeDictionaryAPI}
   api_url: https://api.dictionaryapi.dev/api/v2/entries/  # API URL of the free Dictionary API
   lang_type: en  # language type of the dictionary you want, 'en' for English dictionary
 
-  # wikipedia api config, which is used to get wikipedia information for type words
+  # 2. wikipedia api config, which is used to get wikipedia information for type words
   # see https://wikipedia.readthedocs.io/en/latest/quickstart.html for more details
   sentences: 2  # number of sentences to be extracted from Wikipedia Encyclopedia
   auto_suggest: False  # whether to automatically search for alternative suggestions if the query word is not found. Default is False.
+
+  # 3. clustering config
+  emb_model: ./ckpt/princeton-nlp/sup-simcse-roberta-large # embedding model, see detail at https://github.com/princeton-nlp/SimCSE
+  emb_bs: 800  # batch size for embedding model
+  local_files_only: True  # If True, offline mode. https://huggingface.co/docs/transformers/installation#offline-mode
+
+  # Bisecting K-Means config
+  # see detail at https://scikit-learn.org/stable/modules/generated/sklearn.cluster.BisectingKMeans.html#sklearn.cluster.BisectingKMeans
+  n_clusters: 400  # cluster number for clustering. The smaller the value, the more accurate the disambiguation result will be。
+  init: k-means++ # Method for initialization, we can choose ('k-means++', 'random', 'callable') or
+  n_init: 3  # Number of time the inner k-means algorithm will be run with different centroid seeds in each bisection.
+  random_state: 16  # the random seed, Use an int to make the randomness deterministic
+  bisecting_strategy: largest_cluster  # Defines how bisection should be performed; choose from {“biggest_inertia”, “largest_cluster”}
+
+  # 4. judge (by LLMs) config
+  jud_model: ./ckpt/Mistral-7B-Instruct-v0.2  # https://huggingface.co/mistralai/Mistral-7B-Instruct-v0.2
+  jud_prompt: >-
+    <s>[INST]
+    You are a professional and helpful English linguist. 
+    You diligently complete tasks as instructed. 
+    You are about to read two definitions (i.e., definition A and definition B), which are followed by examples and 
+    delimited by triple dashes (i.e., ---). 
+    Please judge whether two definitions have similar meanings or explaining a same noun word by performing the following actions: 
+    1) Think the first question carefully: Are the meanings of these two definitions similar? 
+    2) Think the second question carefully: Are the two definitions explaining a same noun?  
+    3) If you answer "Yes" to one of the above questions, only output 1; Otherwise, only output 0.
+    4) Please note that expect for 0 or 1, all other text, punctuation, numbers, and whitespace characters are not allowed in the output.
+
+    ### Start examples
+    definition A: Any great, strong, powerful emotion, especially romantic love or extreme hate.
+    definition B: A passionate individual.
+    0
+
+    definition A: A cargo ship or freighter is a merchant ship that carries cargo, goods, and materials from one port to another. Thousands of cargo carriers ply the world's seas and oceans each year, handling the bulk of international trade.
+    definition B: Any vessel designed to carry cargo.
+    1
+  
+    definition A: A flammable liquid consisting of a mixture of refined petroleum hydrocarbons, mainly used as a motor fuel; petrol.
+    definition B: Petroleum, a fluid consisting of a mixture of refined petroleum hydrocarbons, primarily consisting of octane, commonly used as a motor fuel.
+    1
+  
+    definition A: A shop or store that sells groceries; a grocery store.
+    definition B: a shop that sells cakes.
+    0
+    ### End examples
+    
+    ---
+    definition A: {first_definition}
+    definition B: {second_definition}
+    ---
+    [/INST]
+
+  jud_temperature: 0.1  # temperature for judgment model. We expect the judge model output deterministic results, so we set temperature to 0.1.
+  jud_top_p: 0.6  # top_p for judgment model. The smaller the value, the more deterministic the model output is.
+  jud_max_tokens: 3  # We only need to output 1 or 0, so we set max_tokens to 5.
+  jud_bs: 48  # batch size for judgment model
+  tensor_parallel_size: 4  # the number of GPUs you want to use for running multi-GPU inference.
+  dtype: float16  # https://docs.vllm.ai/en/latest/models/engine_args.html#cmdoption-dtype
+  jud_res_cache_file: ./data/ufer_types/jud_results.csv  # cache judgment results file
 
 # pre-process config
 preprocess:
