@@ -76,6 +76,11 @@ type_cfg:  # UFER type config
     ---
     [/INST]
 
+  jud_verify_prompt: >-
+    <s>[INST]
+    Your answer is not allowed. Please think again and only output 0 or 1. 
+    [/INST] 
+
   jud_temperature: 0.1  # temperature for judgment model. We expect the judge model output deterministic results, so we set temperature to 0.1.
   jud_top_p: 0.6  # top_p for judgment model. The smaller the value, the more deterministic the model output is.
   jud_max_tokens: 3  # We only need to output 1 or 0, so we set max_tokens to 5.
@@ -83,6 +88,8 @@ type_cfg:  # UFER type config
   tensor_parallel_size: 4  # the number of GPUs you want to use for running multi-GPU inference.
   dtype: float16  # https://docs.vllm.ai/en/latest/models/engine_args.html#cmdoption-dtype
   jud_res_cache_file: ./data/ufer_types/jud_results.csv  # cache judgment results file
+  ver_res_cache_file: ./data/ufer_types/verify_results.csv  # cache verification results file
+  verify_convs_cache_file: ./data/ufer_types/verify_convs.csv  # cache verification conversations file
 
 # pre-process config
 preprocess:

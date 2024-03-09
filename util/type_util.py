@@ -8,7 +8,7 @@ This module is used to help build the type information of the UFER dataset, incl
     d) We use the first two sentences of Wikipedia Encyclopedia corresponding to that word as the definition.
 2) remove unsuitable type words.
 """
-
+import ast
 import re
 import os
 import requests
@@ -159,108 +159,149 @@ def del_none(in_file, out_file):
                 count += 1
 
 
-def judge_by_llm(clusters, input_type_info, **kwargs):
+def judge_by_llm(clusters, input_type_info, defi_word_id_pair, **kwargs):
     """
     Judge the similarity of the definitions in each cluster by LLMs and remove the redundant definitions from each cluster.
 
     :param clusters: The clusters of the definitions of the type words. Each cluster is a list of dict, where each dict
         contains the id of the definition and the definition.
     :param input_type_info: The information of the type words. It's a dict, where the key is the id of the type word and
+    :param defi_word_id_pair: Some type word have more than one definition.  We use defi_word_id_pair to track type word
+        and its definition. e.g. {0:0, 1:0} means that the word (its id is 0) has two definition (defi_id 0 and defi_id 1)
     :param kwargs:
         1) jud_model: the LLM used to judge. model_name or path.
         2) jud_prompt: prompt for the judge model.
-        3) jud_temperature: temperature for the judge model. Default is 0.
-        4) jud_top_p: top_p for the judge model. he smaller the value, the more deterministic the model output is.
-        5) jud_max_tokens: The maximum number of tokens to generate.
-        6) jud_bs: batch size for jud_model.
-        7) tensor_parallel_size: The number of GPUs you want to use for running multi-GPU inference.
-        8) dtype: The data type of the input tensor. https://docs.vllm.ai/en/latest/models/engine_args.html#cmdoption-dtype
-        9) jud_res_cache_file: the file to cache the judge results.
-    :return: The redundant definitions' ids i.
+        3) jud_verify_prompt: prompt for the judge model to verify the answer.  We need to continue the conversation to
+            ask for the correct answer
+        4) jud_temperature: temperature for the judge model. Default is 0.
+        5) jud_top_p: top_p for the judge model. he smaller the value, the more deterministic the model output is.
+        6) jud_max_tokens: The maximum number of tokens to generate.
+        7) jud_bs: batch size for jud_model.
+        8) tensor_parallel_size: The number of GPUs you want to use for running multi-GPU inference.
+        9) dtype: The data type of the input tensor. https://docs.vllm.ai/en/latest/models/engine_args.html#cmdoption-dtype
+        10) jud_res_cache_file: the file to cache the judge results.
+        11) ver_res_cache_file: the file to cache the judge results after verification.
+        12) verify_convs_cache_file: the file to cache the verification conversations.
+    :return: List[int], The redundant definitions' ids.
     """
-    # 4. judge by LLMs. We use vLLM for faster inference
-    # 4.1 Import the judge model
-    # https://docs.vllm.ai/en/latest/getting_started/quickstart.html
-    jud_model = LLM(model=kwargs['jud_model'], tensor_parallel_size=kwargs['tensor_parallel_size'], dtype=kwargs['dtype'])
-    sampling_params = SamplingParams(temperature=kwargs['jud_temperature'], top_p=kwargs['jud_top_p'],
-                                     max_tokens=kwargs['jud_max_tokens'])
+    if not os.path.exists(kwargs['ver_res_cache_file']):  # if judge result (after verification) doesn't exist, we should judge from scratch
+        # 4. judge by LLMs. We use vLLM for faster inference
+        # 4.1 Import the judge model
+        # https://docs.vllm.ai/en/latest/getting_started/quickstart.html
+        jud_model = LLM(model=kwargs['jud_model'], tensor_parallel_size=kwargs['tensor_parallel_size'], dtype=kwargs['dtype'])
+        sampling_params = SamplingParams(temperature=kwargs['jud_temperature'], top_p=kwargs['jud_top_p'],
+                                         max_tokens=kwargs['jud_max_tokens'])
 
-    # 4.2 Remove definitions with duplicate meanings in each cluster by pairwise comparison
-    # 4.2.1 prepare the prompts input to the judge model
-    definition_pairs, prompts = [], []
-    pair_num_of_clusters = []  # store the number of pairs of each cluster
-    defi_As, defi_Bs = [], []  # cache the definition A and B in each pair
-    for cluster in clusters:
-        # get definition pair in this clustering
-        # https://docs.python.org/3.8/library/itertools.html#itertools.combinations
-        defi_pair = list(itertools.combinations(cluster, 2))
-        definition_pairs += defi_pair
-        pair_num_of_clusters.append(len(defi_pair))
-        for defi_A, defi_B in defi_pair:  # process the prompts
-            defi_As.append(defi_A)
-            defi_Bs.append(defi_B)
-            prompts.append(kwargs['jud_prompt'].format(first_definition=defi_A['definition'],
-                                                       second_definition=defi_B['definition']))
+        # 4.2 Remove definitions with duplicate meanings in each cluster by pairwise comparison
+        # 4.2.1 prepare the prompts input to the judge model
+        prompts = []  # store the prompts
+        defi_As, defi_Bs = [], []  # store the first and second def of each pair respectively
+        pair_num_of_clusters = []  # store the number of pairs of each cluster
+        for cluster in clusters:
+            # get definition pair in this clustering
+            # https://docs.python.org/3.8/library/itertools.html#itertools.combinations
+            defi_pair = list(itertools.combinations(cluster, 2))
+            pair_num_of_clusters.append(len(defi_pair))
+            for defi_A, defi_B in defi_pair:  # process the prompts
+                defi_As.append(defi_A)
+                defi_Bs.append(defi_B)
+                prompts.append(kwargs['jud_prompt'].format(first_definition=defi_A['definition'],
+                                                           second_definition=defi_B['definition']))
 
-    # 4.2.2 prepare the batched prompts input to the judge model, and then judge
-    jud_results = []  # store the judge result
-    pattern = r'\d+'  # pattern to match the number in the output
-    prompts_loader = DataLoader(prompts, batch_size=kwargs['jud_bs'], shuffle=False)
-    with tqdm(total=len(prompts), desc='judging') as t:
-        for batch_id, batch_prompts in enumerate(prompts_loader):
-            outputs = jud_model.generate(batch_prompts, sampling_params)  # judge
-            for instance_id, output in enumerate(outputs):
-                jud_result = output.outputs[0].text.strip()
-                if jud_result := re.search(pattern, jud_result):
-                    jud_result = int(jud_result.group())
-                    assert jud_result in (1, 0), f'LLM generated wrong result: {jud_result}'
-                else:
-                    raise ValueError(f"LLM didn't generated answer we needed: {jud_result}")
-                jud_results.append(jud_result)
-            t.update(kwargs['jud_bs'])
+        # 4.2.2 prepare the batched prompts input to the judge model, and then judge
+        jud_results = []  # store the judge result
+        verify_convs = []  # store the verification conversations need to be continued to ask for the correct answer
+        verify_conv_ids = []  # store the id of the verification conversations need to be continued
+        pattern = r'\d+'  # pattern to match the number in the output
+        prompts_loader = DataLoader(prompts, batch_size=kwargs['jud_bs'], shuffle=False)
+        with tqdm(total=len(prompts), desc='judging') as t:
+            for batch_id, batch_prompts in enumerate(prompts_loader):
+                outputs = jud_model.generate(batch_prompts, sampling_params)  # judge
+                for out_id, output in enumerate(outputs):
+                    conv_id = batch_id * kwargs['jud_bs'] + out_id  # the id of the conversation
+                    out_answer = output.outputs[0].text
+                    if jud_result := re.search(pattern, out_answer):  # there is a number in the output
+                        jud_result = int(jud_result.group())
+                        if jud_result in (1, 0):  # LLM generated correct result
+                            jud_results.append(jud_result)  # here, jud_result is 1 or 0
+                            continue
+                    # There are 2 cases to execute the following code:
+                    # 1) There is no number in the output,
+                    # 2) The number is not 1 or 0, which means that the LLM generated wrong result
+                    #  We should store those verification conversations, which need to be continued to ask for the correct answer.
+                    jud_results.append(-1)  # label the result as -1, which means that the LLM didn't generated answer we needed
+                    verify_convs.append(output.prompt + out_answer + '</s>' + kwargs['jud_verify_prompt'])
+                    verify_conv_ids.append(conv_id)
+                t.update(kwargs['jud_bs'])
 
-    # 4.2.3 cache the judge results
-    cache_jud_results = {'jud_result': jud_results, 'defi_A': defi_As, 'defi_B': defi_Bs}
-    pd.DataFrame(cache_jud_results).to_csv(kwargs['jud_res_cache_file'], index_label='id')
+        # 4.2.3 cache the judge results and the verification conversations
+        cache_jud_results = {'jud_results': jud_results, 'definition_A': defi_As, 'definition_B': defi_Bs}
+        cache_verify_convs = {'verify_conv_ids': verify_conv_ids, 'verify_convs': verify_convs}
+        pd.DataFrame(cache_jud_results).to_csv(kwargs['jud_res_cache_file'], index_label='id')
+        pd.DataFrame(cache_verify_convs).to_csv(kwargs['verify_convs_cache_file'], index_label='id')
 
-    # 4.2.4 Remove similar defs in each cluster according to the judge results
-    start_pos = 0
+        # 4.2.4 start to verify We need to continue the conversation to ask for the correct answer
+        verify_convs_loader = DataLoader(verify_convs, batch_size=kwargs['jud_bs'], shuffle=False)
+        verify_conv_ids_loader = DataLoader(verify_conv_ids, batch_size=kwargs['jud_bs'], shuffle=False)
+        with tqdm(total=len(verify_convs), desc='verifying') as t:
+            for batch_convs, batch_conv_ids in zip(verify_convs_loader, verify_conv_ids_loader):
+                outputs = jud_model.generate(batch_convs, sampling_params)  # verify
+                for conv_id, output in zip(batch_conv_ids, outputs):
+                    out_answer = output.outputs[0].text
+                    if jud_result := re.search(pattern, out_answer):  # there is a number in the output
+                        jud_result = int(jud_result.group())
+                        if jud_result in (1, 0):  # LLM generated correct result
+                            jud_results[conv_id] = jud_result  # here, jud_result is 1 or 0
+                            continue
+                    raise ValueError(f"LLM didn't generate answer we needed: {jud_result}")
+                t.update(kwargs['jud_bs'])
+
+        # 4.2.5 cache the results after verification
+        cache_jud_results = {'jud_results': jud_results, 'definition_A': defi_As, 'definition_B': defi_Bs}
+        pd.DataFrame(cache_jud_results).to_csv(kwargs['ver_res_cache_file'], index_label='id')
+    else:  # read the judge result (after verification) from the cache file directly
+        print(f"Read directly the judge result (after verification) from the cache file: {kwargs['ver_res_cache_file']}")
+        cache_ver_jud_results = pd.read_csv(kwargs['ver_res_cache_file'])
+        jud_results = cache_ver_jud_results['jud_results'].tolist()
+        defi_As, defi_Bs = cache_ver_jud_results['definition_A'].tolist(), cache_ver_jud_results['definition_B'].tolist()
+        defi_As, defi_Bs = map(ast.literal_eval, defi_As), map(ast.literal_eval, defi_Bs)  # convert string to dict
+        definition_pairs = zip(defi_As, defi_Bs)
+
+    # 4.2.6 Remove similar defs according to the judge results
     redundant_id = []  # to store the id of the redundant definition
-    for pair_num in pair_num_of_clusters:
-        # get definition pairs and judge result in this cluster
-        # pair_num is the number of pairs of each cluster
-        defi_pairs_in_cluster = definition_pairs[start_pos:start_pos + pair_num]
-        jud_result_in_cluster = jud_results[start_pos:start_pos + pair_num]
 
-        # only leave pairs with similar definitions
-        # https://docs.python.org/3.8/library/itertools.html#itertools.compress
-        # e.g. [(A,B), (A,C), (A,D), (A,E), (B,C), (B,D), (B,E), (C,D), (C,E)] -> [(A, B), (A, D), (B, D), (C, E)]
-        # It means that obj A, B, and D have similar meanings, which is the same applies to obj C and E.
-        # The judge result is a list like [1, 0, 1, 0...], where 1 means that the definition are similar in that pair.
-        similar_pairs = itertools.compress(defi_pairs_in_cluster, jud_result_in_cluster)
+    # only leave pairs with similar definitions
+    # https://docs.python.org/3.8/library/itertools.html#itertools.compress
+    # e.g. [(A,B), (A,C), (A,D), (A,E), (B,C), (B,D), (B,E), (C,D), (C,E)] -> [(A, B), (A, D), (B, D), (C, E)]
+    # It means that obj A, B, and D have similar meanings, which is the same applies to obj C and E.
+    # The judge result is a list like [1, 0, 1, 0...], where 1 means that the definition are similar in that pair.
+    similar_pairs = itertools.compress(definition_pairs, jud_results)
 
-        # Store the id of the redundant definition
-        # group by the ID (i.e, defi_id) of the first definition in a pair
-        # https://docs.python.org/3.8/library/itertools.html#itertools.groupby
-        # e.g. [(A, B), (A, D), (B, D), (C, E)] -> (A, B), (A, D) | (B, D) | (C, E)
-        for key, group in itertools.groupby(similar_pairs, key=lambda x: x[0]['defi_id']):
-            # e.g. (A, B), (A, D) -> (A, B, D)
-            definition_set = set()  # A set to store similar definition
-            for pair in group:
-                definition_set.update(pair)
+    # Store the id of the redundant definition
+    # group by the ID (i.e, defi_id) of the first definition in a pair
+    # https://docs.python.org/3.8/library/itertools.html#itertools.groupby
+    # e.g. [(A, B), (A, D), (B, D), (C, E)] -> (A, B), (A, D) | (B, D) | (C, E)
+    for key, group in itertools.groupby(similar_pairs, key=lambda x: x[0]['defi_id']):
+        # e.g. (A, B), (A, D) -> (A, B, D)
+        definition_id_set = set()  # A set to store the ids of similar definitions
+        for pair in group:
+            for e in pair:
+                definition_id_set.add(e['defi_id'])
 
-            # Compare the number of definitions of source words.
-            # We leave the word with the least definitions.
-            # And the others are considered as the redundant word
-            # input_type_info like {1:{"word": "body_part", "source": "other", "definitions": ["a part of a human body."]}}
-            # x['defi_id'] is the defi_id like 1,
-            # input_type_info[x['defi_id']] is {"word": "body_part", "source": "other", "definitions": ["a part of a human body."]}
-            # input_type_info[x['defi_id']]['definitions'] is ["a part of a human body."]
-            tmp_redundant_id = [e['defi_id'] for e in definition_set]
-            tmp_redundant_id.sort(key=lambda x: len(input_type_info[x['defi_id']]['definitions']))
-            left_definition_id = tmp_redundant_id[0]
-            tmp_redundant_id.remove(left_definition_id)  # the others are redundant
-            redundant_id += tmp_redundant_id
+        # Compare the number of definitions of source words.
+        # We leave the word with the least definitions.
+        # And the others are considered as the redundant word
+        # input_type_info like {1:{"word": "body_part", "source": "other", "definitions": ["a part of a human body."]}}
+        # x is the defi_id like 1,
+        # defi_word_id_pair , e.g. {0:0, 1:0} means that the word (its id is 0) has two definition (defi_id 0 and defi_id 1)
+        # defi_word_id_pair[x] is the source word's id of the defi_id x
+        # input_type_info[defi_word_id_pair[x]] is {"word": "body_part", "source": "other", "definitions": ["a part of a human body."]}
+        # input_type_info[defi_word_id_pair[x]]['definitions'] is ["a part of a human body."]
+        tmp_redundant_id = [id for id in definition_id_set]
+        tmp_redundant_id.sort(key=lambda x: len(input_type_info[defi_word_id_pair[x]]['definitions']))  # ascending order
+        left_definition_id = tmp_redundant_id[0]
+        tmp_redundant_id.remove(left_definition_id)  # the others are redundant
+        redundant_id += tmp_redundant_id
 
     return redundant_id
 
@@ -313,18 +354,18 @@ def disambiguate_type_word(in_file, out_file, cuda_devices, **kwargs):
     # 2. Preprocess and tokenize the definitions of the input type words
     # 2.1. get type words' definitions
     all_definitions, all_definitions_embbedings = [], []  # store all definition and its embeddings
-    word_defi_id_pair = dict()  #  Some type word have more than one definition. We use word_defi_id_pair to track type word and its definition
+    defi_word_id_pair = dict()  #  Some type word have more than one definition. We use defi_word_id_pair to track type word and its definition
     defi_id = 0  # index all definition.
     input_type_info = dict()  # store the input type information
     with jsonlines.open(in_file, mode='r') as in_file:
         for line in in_file:
-            word_id, definitions = str(line['id']), line['definitions']
+            word_id, definitions = line['id'], line['definitions']
             del line['id']
             input_type_info.update({word_id: line})  # e.g. {1:{"word": "body_part", "source": "other", "definitions": ["a part of a human body."]}}
             for defi in definitions:
                 if defi != 'None':
                     all_definitions.append(defi)
-                    word_defi_id_pair.update({defi_id: word_id})  # e.g. {0:0, 1:0} means that the word (0) has two definition (defi 0 and defi 1)
+                    defi_word_id_pair.update({defi_id: word_id})  # e.g. {0:0, 1:0} means that the word (its id is 0) has two definition (defi_id 0 and defi_id 1)
                     defi_id += 1
 
     # 2.2. get embeddings of the whole definitions
@@ -355,17 +396,17 @@ def disambiguate_type_word(in_file, out_file, cuda_devices, **kwargs):
     torch.cuda.empty_cache()
 
    # 4. judge by LLMs. We use vLLM for faster inference
-    redundant_id = judge_by_llm(clusters, input_type_info, **kwargs)
+    redundant_id = judge_by_llm(clusters, input_type_info, defi_word_id_pair, **kwargs)
 
     # 5 filter and output the result
     # 5.1 filter the redundant definition according the redundant_id
-    # e.g. [(0, 0), (1, 0), (2, 0), (3, 1), (4, 1), (5, 2), (6, 3)] -> [(0, 0), (2, 0), (3, 1), (6, 3)]
-    result = filter(lambda defi_id, _ : defi_id not in redundant_id, word_defi_id_pair.items())
+    # e.g. [(0, 0), (1, 0), (2, 0), (3, 1), (4, 1), (5, 2), (6, 3), (7, 3)] -> [(0, 0), (2, 0), (3, 1), (6, 3), (7, 3)]
+    result = filter(lambda item: item[0] not in redundant_id, defi_word_id_pair.items())
     with jsonlines.open(out_file, 'w') as writer:
 
-        # group by the original word_id (the second element of the tuple in the word_defi_id_pair)
-        # e.g. [(0, 0), (2, 0), (3, 1), (6, 3)] -> [(0, 0), (2, 0)] | [(3, 1)] | [(6, 3)]
-        # key is the original word_id like 0, group is the definition ids of the word_id like [(0, 0), (2, 0)]
+        # group by the original word_id (the second element of the tuple in the defi_word_id_pair)
+        # e.g. [(0, 0), (2, 0), (3, 1), (6, 3), (7, 3)] -> [(0, 0), (2, 0)] | [(3, 1)] | [(6, 3), (7, 3)]
+        # key is the original word_id (i.e., x[1]) like 0, group is the definition ids of the word_id like [(0, 0), (2, 0)]
         for new_word_id, (orig_word_id, group) in enumerate(itertools.groupby(result, key=lambda x: x[1])):
             definitions = [all_definitions[defi_id] for defi_id, _ in group]
             writer.write({'id': new_word_id,
