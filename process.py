@@ -24,7 +24,6 @@ class Processor:
     def __init__(self, config_file):
         with open(config_file, 'r') as f:
             self.config = yaml.load(f, Loader=SafeLoader)
-        self.num_workers = self.config['num_workers']
         self.num_shards = self.config['num_shards']
         self.cuda_devices = self.config['cuda_devices']
         self.data_dir = self.config['data_dir']
@@ -155,12 +154,12 @@ class Processor:
             3) 2: cache file after meaning disambiguation, skip the first two steps.
         """
         assert cache_stage in [0, 1, 2], f"cache_stage must be one of (0, 1, 2)!"
-        type_cfg = self.config['type_cfg']
-        original_type_vocab = type_cfg['original_type_vocab']
-        type_info_dir = os.path.dirname(original_type_vocab)
+        type_cfg = self.config['type_cfg']  # get type configuration
+        work_dir = type_cfg['work_dir']  # get the work directory
+        original_type_vocab = os.path.join(work_dir, type_cfg['original_type_vocab'])
 
         # 1. First, get type word (including its definition) according to the original type vocabulary
-        cache_info_file_0 = os.path.join(type_info_dir, '0_cache_none_type_info.jsonl')
+        cache_info_file_0 = os.path.join(work_dir, type_cfg['cache_info_file_0'])
         if cache_stage == 0:
             print("=" * 20 + " Building type information of the UFER dataset " + "=" * 20)
 
@@ -195,26 +194,30 @@ class Processor:
         # and we label redundant words' definitions as 'None'.
         # ...
 
-        cache_info_file_1 = os.path.join(type_info_dir, '1_cache_no_none_type_info.jsonl')
+        cache_info_file_1 = os.path.join(work_dir, type_cfg['cache_info_file_1'])
         if cache_stage == 1:
             # 3. Third, remove the words with the definition 'None'.
             print("Remove the words with the definition 'None'.")
             del_none(in_file=cache_info_file_0, out_file=cache_info_file_1)
             cache_stage += 1
 
-        cache_info_file_2 = os.path.join(type_info_dir, '2_cache_disambiguation_type_info.jsonl')
+        cache_info_file_2 = os.path.join(work_dir, type_cfg['cache_info_file_2'])
         if cache_stage == 2:
             # 4. Forth, remove similar meanings using Clustering and LLMs.
             print("Remove similar meanings using Clustering and LLMs.")
             disambiguate_type_word(in_file=cache_info_file_1,
                                    out_file=cache_info_file_2,
                                    cuda_devices= self.cuda_devices,
-                                   **type_cfg)
+                                   **type_cfg)  # type_cfg is the type configuration
             print("Building type information of the UFER dataset Done!")
 
-    def get_type_info(self):
+        return cache_info_file_2
+
+    def get_type_info(self, type_info_file=None):
         """
         Get type information of the UFER dataset from the type_info_file.
+
+        :param type_info_file: The file to store type information. If None, we will use the default file in the config file.
         """
         type_cfg = self.config['type_cfg']
 
@@ -222,7 +225,10 @@ class Processor:
         self.type_info['type_vocab'] = []  # a list to store type words, just their literal values
         self.type_info['type_words_dict'] = dict()  # # a dict to store all type information. key: type word, value: TypeWord object
         self.type_info['type_words_list'] = []  # a Sequence to store all type information. Each element is a TypeWord object
-        with jsonlines.open(type_cfg['type_info_file'],'r') as reader:
+
+        if type_info_file is None:
+            type_info_file = type_cfg['type_info_file']
+        with jsonlines.open(type_info_file,'r') as reader:
             for line in tqdm(reader, desc='get type info...'):
                 type_word_obj = TypeWord(**line)
                 type_word = line['word']
@@ -296,7 +302,7 @@ class Processor:
             7) stanza_model: The stanza parser config we use.
         :return:
         """
-        assert kwargs['mode'] in ['strict', 'loose'], f"mode must be one of ('stric', loose)!"
+
         if self.cuda_devices == 'all':
             # set the GPU can be used by stanza in this process
             os.environ["CUDA_VISIBLE_DEVICES"] = str(rank % torch.cuda.device_count())
@@ -449,6 +455,8 @@ class Processor:
                 # convert start/end index to string, to be consistent with the format of spans. This operation ensures
                 # that the tuple is successfully converted to pyarrow and then serialized into a JSON/JSONL array
                 max_span_len = kwargs['span_portion'] * len(sent)
+
+                assert kwargs['mode'] in ['strict', 'loose'], f"mode must be one of ('stric', loose)!"
                 if kwargs['mode'] == 'strict':
                     # In strict (default) mode, we get spans based on intersection of spaCy and Stanza results.
                     spans = [(str(start), str(end), text)
@@ -470,6 +478,27 @@ class Processor:
             'span': out_spans,
         }
 
+    def stage2(self, instances, rank = 0, **kwargs):
+        """
+        Stage2, annotate the given entity mention  in the instances.
+
+        :param instances:
+        :param rank:
+        :param kwargs:
+        :return:
+        """
+        # 0. GPU setting
+        if self.cuda_devices == 'all':
+            # set the GPU can be used by stanza in this process
+            os.environ["CUDA_VISIBLE_DEVICES"] = str(rank % torch.cuda.device_count())
+
+        else:
+            cuda_devices = str(self.cuda_devices).split(',')
+            gpu_id = rank % len(cuda_devices)
+            os.environ["CUDA_VISIBLE_DEVICES"] = str(cuda_devices[gpu_id])
+
+        # todo: add your code here
+
     def process(self, stage):
         """
         Process the data in the given stage.
@@ -486,12 +515,16 @@ class Processor:
         stage_cfg = self.config[stage]
         in_dir = stage_cfg['in_dir']
         out_dir = os.path.join(self.data_dir, stage)
-        out_dir = os.path.join(out_dir, stage_cfg['mode'])
-        if not os.path.exists(out_dir):
-            os.makedirs(out_dir)
-
         if stage == 'stage1':
             process_func = self.stage1 # Specify the function to be used in the given stage.
+            out_dir = os.path.join(out_dir, stage_cfg['mode'])
+
+        elif stage == 'stage2':
+            process_func = self.stage2
+            out_dir = os.path.join(out_dir, stage_cfg['annotate_model'])
+
+        if not os.path.exists(out_dir):
+            os.makedirs(out_dir)
 
         # 2. process each file in the given directory
         for path, dir_lst, file_lst in os.walk(in_dir):
@@ -527,7 +560,7 @@ class Processor:
                                           batched = True,
                                           with_rank = True,
                                           batch_size = stage_cfg['batch_size_per_device'] * stage_cfg['batch_num_per_device'],
-                                          num_proc = self.num_workers,
+                                          num_proc = stage_cfg['num_workers'],
                                           remove_columns = dataset.column_names,  # Remove unnecessary columns from the original dataset
                                           )
                     processed_datasets.append(sub_dataset)
@@ -544,10 +577,13 @@ class Processor:
         pass
 
 def main():
+    # 0. init config
     config_file = r'config.yml'
     processor = Processor(config_file)
-    processor.build_type_info(cache_stage=2)  # 1. build type information first
-    processor.get_type_info()  # 2. then, get type information
+
+    # 1. build type information first
+    type_info_file = processor.build_type_info(cache_stage=2)  # return the type information after disambiguation
+    processor.get_type_info(type_info_file)  # 2. then, get type information
     # processor.pre_process()  # 3. pre-process the data
     # processor.process('stage1')  # 4. stage1, filter short sentences, get NP spans and NE spans in sentences. English only.
 
