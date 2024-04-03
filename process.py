@@ -171,7 +171,7 @@ class Processor:
 
         # 1. First, get type word (including its definition) according to the original type words
         cache_info_file_0 = os.path.join(work_dir, type_cfg['cache_info_file_0'])
-        if cache_stage == 0:
+        if cache_stage == 0 and not os.path.exists(cache_info_file_0):
             print("=" * 20 + " Building type information of the UFER dataset " + "=" * 20)
 
             # Due to some reason (network or request limit), the build process stop.
@@ -206,7 +206,7 @@ class Processor:
         # ...
 
         cache_info_file_1 = os.path.join(work_dir, type_cfg['cache_info_file_1'])
-        if cache_stage == 1:
+        if cache_stage == 1 and not os.path.exists(cache_info_file_1):
             # 3. Third, remove the words with the definition 'None'.
             print("Remove the words with the definition 'None'.")
             del_none(in_file=cache_info_file_0, out_file=cache_info_file_1)
@@ -214,7 +214,7 @@ class Processor:
 
         cache_info_file_2 = os.path.join(work_dir, type_cfg['cache_info_file_2'])
         type_info_file = os.path.join(work_dir, type_cfg['type_info_file'])
-        if cache_stage == 2:
+        if cache_stage == 2 and not os.path.exists(cache_info_file_2):
             # 4. Forth, remove similar meanings using Clustering and LLMs.
             print("Remove similar meanings using Clustering and LLMs.")
             disambiguate_type_word(in_file=cache_info_file_1,
@@ -830,7 +830,7 @@ def main():
     processor.get_type_info(type_info_file)
 
     # 4. stage2, annotate the given entity mention in the instances by multiple LLMs.
-    processor.process('stage2')
+    # processor.process('stage2')
 
 if __name__ == '__main__':
     main()

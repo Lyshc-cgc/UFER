@@ -17,7 +17,158 @@ lang_type: en  # language type of the dictionary you want, 'en' for English dict
 sentences: 2  # number of sentences to be extracted from Wikipedia Encyclopedia
 auto_suggest: False  # whether to automatically search for alternative suggestions if the query word is not found. Default is False.
 
-# 3. clustering config
+# 3. LLMs for getting the best definition for type words
+def_models:
+  -
+    name: Mistral
+    # https://huggingface.co/mistralai/Mistral-7B-Instruct-v0.2
+    checkpoint: ckpt/Mistral-7B-Instruct-v0.2  # your path to the model checkpoint
+    # https://huggingface.co/mistralai/Mistral-7B-Instruct-v0.2#instruction-format
+    jud_usr_prompt: >-
+      You are a professional and helpful English linguist. 
+      You diligently complete tasks as instructed. 
+      You are about to read two definitions (i.e., definition A and definition B), which are followed by examples and 
+      delimited by triple dashes (i.e., ---). 
+      Please judge whether two definitions have similar meanings or explaining a same noun word by performing the following actions: 
+      1) Think the first question carefully: Are the meanings of these two definitions similar? 
+      2) Think the second question carefully: Are the two definitions explaining a same noun?  
+      3) If you answer "Yes" to one of the above questions, only output 1; Otherwise, only output 0.
+      4) Please note that expect for 0 or 1, all other text, punctuation, numbers, and whitespace characters are not allowed in the output.
+
+      ### Start examples
+      definition A: Any great, strong, powerful emotion, especially romantic love or extreme hate.
+      definition B: A passionate individual.
+      0
+
+      definition A: A cargo ship or freighter is a merchant ship that carries cargo, goods, and materials from one port to another. Thousands of cargo carriers ply the world's seas and oceans each year, handling the bulk of international trade.
+      definition B: Any vessel designed to carry cargo.
+      1
+
+      definition A: A flammable liquid consisting of a mixture of refined petroleum hydrocarbons, mainly used as a motor fuel; petrol.
+      definition B: Petroleum, a fluid consisting of a mixture of refined petroleum hydrocarbons, primarily consisting of octane, commonly used as a motor fuel.
+      1
+
+      definition A: A shop or store that sells groceries; a grocery store.
+      definition B: a shop that sells cakes.
+      0
+      ### End examples
+
+      ---
+      definition A: {first_definition} 
+      definition B: {second_definition}
+      ---
+
+    jud_verify_prompt: >-
+      Your answer is not allowed. Please think again and only output 0 or 1.
+
+    jud_temperature: 0.1  # temperature for this model. We expect the judge model output deterministic results, so we set temperature to 0.1.
+    jud_top_p: 0.6  # top_p for this model. The smaller the value, the more deterministic the model output is.
+    jud_max_tokens: 3  # We only need to output 1 or 0, so we set max_tokens to 5.
+    jud_bs: 24  # batch size for this model
+    dtype: auto  # https://docs.vllm.ai/en/latest/models/engine_args.html#cmdoption-dtype
+    jud_res_cache_file: jud_results.csv  # cache judgment results file
+    ver_res_cache_file: verify_results.csv  # the file for caching the judge results after verification. Each judge model will have a such file.
+    verify_convs_cache_file: verify_convs.csv  # the file for caching the verification conversations. Each judge model will have a such file.
+
+  -
+    name: Qwen
+    # https://huggingface.co/Qwen/Qwen1.5-14B-Chat
+    checkpoint: ckpt/Qwen/Qwen1.5-14B-Chat  # your path to the model checkpoint
+    # qwen has system prompt. We can input the examples in a form of chatting
+    # https://huggingface.co/Qwen/Qwen1.5-14B-Chat#quickstart
+    jud_sys_prompt: >-
+      You are a professional and helpful English linguist. 
+      You are about to read two definitions (i.e., definition A and definition B).
+      Please judge whether two definitions have similar meanings or explaining a same noun word by performing the following actions: 
+      1) Think the first question carefully: Are the meanings of these two definitions similar? 
+      2) Think the second question carefully: Are the two definitions explaining a same noun?  
+      3) If you answer "Yes" to one of the above questions, only output 1; Otherwise, only output 0.
+      4) Please note that expect for 0 or 1, all other text, punctuation, numbers, and whitespace characters are not allowed in the output.
+
+    # the examples can be input in a form of chatting
+    jud_examples: # examples input in a form of chatting
+      - definition_A: Any great, strong, powerful emotion, especially romantic love or extreme hate.
+        definition_B: A passionate individual.
+        output: 0
+      - definition_A: A cargo ship or freighter is a merchant ship that carries cargo, goods, and materials from one port to another. Thousands of cargo carriers ply the world's seas and oceans each year, handling the bulk of international trade.
+        definition_B: Any vessel designed to carry cargo.
+        output: 1
+      - definition_A: A flammable liquid consisting of a mixture of refined petroleum hydrocarbons, mainly used as a motor fuel; petrol.
+        definition_B: Petroleum, a fluid consisting of a mixture of refined petroleum hydrocarbons, primarily consisting of octane, commonly used as a motor fuel.
+        output: 1
+      - definition_A: A shop or store that sells groceries; a grocery store.
+        definition_B: a shop that sells cakes.
+        output: 0
+    jud_usr_prompt: >-
+      definition A: {first_definition} 
+      definition B: {second_definition}
+
+    jud_verify_prompt: >-
+      Your answer is not allowed. Please think again and only output 0 or 1. 
+
+    jud_temperature: 0.1  # temperature for this model. We expect the judge model output deterministic results, so we set temperature to 0.1.
+    jud_top_p: 0.6  # top_p for this model. The smaller the value, the more deterministic the model output is.
+    jud_max_tokens: 3  # We only need to output 1 or 0, so we set max_tokens to 5.
+    jud_bs: 24  # batch size for this model
+    dtype: auto  # https://docs.vllm.ai/en/latest/models/engine_args.html#cmdoption-dtype
+    jud_res_cache_file: jud_results.csv  # cache judgment results file
+    ver_res_cache_file: verify_results.csv  # the file for caching the judge results after verification. Each judge model will have a such file.
+    verify_convs_cache_file: verify_convs.csv  # the file for caching the verification conversations. Each judge model will have a such file.
+
+  -
+    name: Yi
+    checkpoint: ckpt/01-ai/Yi-6B-Chat  # https://huggingface.co/01-ai/Yi-6B-Chat
+    # https://huggingface.co/01-ai/Yi-6B-Chat#perform-inference-with-yi-chat-model
+    jud_usr_prompt: >-
+      You are a professional and helpful English linguist. 
+      You diligently complete tasks as instructed. 
+      You are about to read two definitions (i.e., definition A and definition B), which are followed by examples and 
+      delimited by triple dashes (i.e., ---). 
+      Please judge whether two definitions have similar meanings or explaining a same noun word by performing the following actions: 
+      1) Think the first question carefully: Are the meanings of these two definitions similar? 
+      2) Think the second question carefully: Are the two definitions explaining a same noun?  
+      3) If you answer "Yes" to one of the above questions, only output 1; Otherwise, only output 0.
+      4) Please note that expect for 0 or 1, all other text, punctuation, numbers, and whitespace characters are not allowed in the output.
+
+      ### Start examples
+      definition A: Any great, strong, powerful emotion, especially romantic love or extreme hate.
+      definition B: A passionate individual.
+      0
+
+      definition A: A cargo ship or freighter is a merchant ship that carries cargo, goods, and materials from one port to another. Thousands of cargo carriers ply the world's seas and oceans each year, handling the bulk of international trade.
+      definition B: Any vessel designed to carry cargo.
+      1
+
+      definition A: A flammable liquid consisting of a mixture of refined petroleum hydrocarbons, mainly used as a motor fuel; petrol.
+      definition B: Petroleum, a fluid consisting of a mixture of refined petroleum hydrocarbons, primarily consisting of octane, commonly used as a motor fuel.
+      1
+
+      definition A: A shop or store that sells groceries; a grocery store.
+      definition B: a shop that sells cakes.
+      0
+      ### End examples
+
+      ---
+      definition A: {first_definition} 
+      definition B: {second_definition}
+      ---
+
+    jud_verify_prompt: >-
+      Your answer is not allowed. Please think again and only output 0 or 1. 
+
+    jud_temperature: 0.1  # temperature for this model. We expect the judge model output deterministic results, so we set temperature to 0.1.
+    jud_top_p: 0.6  # top_p for this model. The smaller the value, the more deterministic the model output is.
+    jud_max_tokens: 3  # We only need to output 1 or 0, so we set max_tokens to 5.
+    jud_bs: 24  # batch size for this model
+    dtype: auto  # https://docs.vllm.ai/en/latest/models/engine_args.html#cmdoption-dtype
+    jud_res_cache_file: jud_results.csv  # cache judgment results file
+    ver_res_cache_file: verify_results.csv  # the file for caching the judge results after verification. Each judge model will have a such file.
+    verify_convs_cache_file: verify_convs.csv  # the file for caching the verification conversations. Each judge model will have a such file.
+  # - add more
+  # you can add more models in the future in a form of the configs like above
+  # all keys in the configs are required!
+
+# 4. clustering config
 emb_model: ckpt/princeton-nlp/sup-simcse-roberta-large # embedding model, see detail at https://github.com/princeton-nlp/SimCSE
 emb_bs: 400  # batch size for embedding model
 local_files_only: True  # If True, offline mode. https://huggingface.co/docs/transformers/installation#offline-mode
@@ -31,165 +182,154 @@ random_state: 16  # the random seed, Use an int to make the randomness determini
 bisecting_strategy: largest_cluster  # Defines how bisection should be performed; choose from {“biggest_inertia”, “largest_cluster”}
 cluster_res_cache_file: cluster_results.csv  # cache cluster results file
 
-# 4. judge (by LLMs) config
+# 5. judge (by LLMs) config
 jud_models:
-  - Mistral
-  - Qwen
-  #- Yi
-  # - add more
-  # you can add more judgment models in the future in a form of the judge model configs like below
+  # judge model configs
+  -
+    name: Mistral
+    # https://huggingface.co/mistralai/Mistral-7B-Instruct-v0.2
+    checkpoint: ckpt/Mistral-7B-Instruct-v0.2  # your path to the model checkpoint
+    # https://huggingface.co/mistralai/Mistral-7B-Instruct-v0.2#instruction-format
+    jud_usr_prompt: >-
+      You are a professional and helpful English linguist. 
+      You diligently complete tasks as instructed. 
+      You are about to read two definitions (i.e., definition A and definition B), which are followed by examples and 
+      delimited by triple dashes (i.e., ---). 
+      Please judge whether two definitions have similar meanings or explaining a same noun word by performing the following actions: 
+      1) Think the first question carefully: Are the meanings of these two definitions similar? 
+      2) Think the second question carefully: Are the two definitions explaining a same noun?  
+      3) If you answer "Yes" to one of the above questions, only output 1; Otherwise, only output 0.
+      4) Please note that expect for 0 or 1, all other text, punctuation, numbers, and whitespace characters are not allowed in the output.
+
+      ### Start examples
+      definition A: Any great, strong, powerful emotion, especially romantic love or extreme hate.
+      definition B: A passionate individual.
+      0
+
+      definition A: A cargo ship or freighter is a merchant ship that carries cargo, goods, and materials from one port to another. Thousands of cargo carriers ply the world's seas and oceans each year, handling the bulk of international trade.
+      definition B: Any vessel designed to carry cargo.
+      1
+
+      definition A: A flammable liquid consisting of a mixture of refined petroleum hydrocarbons, mainly used as a motor fuel; petrol.
+      definition B: Petroleum, a fluid consisting of a mixture of refined petroleum hydrocarbons, primarily consisting of octane, commonly used as a motor fuel.
+      1
+
+      definition A: A shop or store that sells groceries; a grocery store.
+      definition B: a shop that sells cakes.
+      0
+      ### End examples
+
+      ---
+      definition A: {first_definition} 
+      definition B: {second_definition}
+      ---
+
+    jud_verify_prompt: >-
+      Your answer is not allowed. Please think again and only output 0 or 1.
+
+    jud_temperature: 0.1  # temperature for this model. We expect the judge model output deterministic results, so we set temperature to 0.1.
+    jud_top_p: 0.6  # top_p for this model. The smaller the value, the more deterministic the model output is.
+    jud_max_tokens: 3  # We only need to output 1 or 0, so we set max_tokens to 5.
+    jud_bs: 24  # batch size for this model
+    dtype: auto  # https://docs.vllm.ai/en/latest/models/engine_args.html#cmdoption-dtype
+    jud_res_cache_file: jud_results.csv  # cache judgment results file
+    ver_res_cache_file: verify_results.csv  # the file for caching the judge results after verification. Each judge model will have a such file.
+    verify_convs_cache_file: verify_convs.csv  # the file for caching the verification conversations. Each judge model will have a such file.
+
+  -
+   name: Qwen
+    # https://huggingface.co/Qwen/Qwen1.5-14B-Chat
+   checkpoint: ckpt/Qwen/Qwen1.5-14B-Chat  # your path to the model checkpoint
+     # qwen has system prompt. We can input the examples in a form of chatting
+    # https://huggingface.co/Qwen/Qwen1.5-14B-Chat#quickstart
+   jud_sys_prompt: >-
+     You are a professional and helpful English linguist. 
+     You are about to read two definitions (i.e., definition A and definition B).
+     Please judge whether two definitions have similar meanings or explaining a same noun word by performing the following actions: 
+     1) Think the first question carefully: Are the meanings of these two definitions similar? 
+     2) Think the second question carefully: Are the two definitions explaining a same noun?  
+     3) If you answer "Yes" to one of the above questions, only output 1; Otherwise, only output 0.
+     4) Please note that expect for 0 or 1, all other text, punctuation, numbers, and whitespace characters are not allowed in the output.
+     
+     # the examples can be input in a form of chatting
+   jud_examples: # examples input in a form of chatting
+     - definition_A: Any great, strong, powerful emotion, especially romantic love or extreme hate.
+       definition_B: A passionate individual.
+       output: 0
+     - definition_A: A cargo ship or freighter is a merchant ship that carries cargo, goods, and materials from one port to another. Thousands of cargo carriers ply the world's seas and oceans each year, handling the bulk of international trade.
+       definition_B: Any vessel designed to carry cargo.
+       output: 1
+     - definition_A: A flammable liquid consisting of a mixture of refined petroleum hydrocarbons, mainly used as a motor fuel; petrol.
+       definition_B: Petroleum, a fluid consisting of a mixture of refined petroleum hydrocarbons, primarily consisting of octane, commonly used as a motor fuel.
+       output: 1
+     - definition_A: A shop or store that sells groceries; a grocery store.
+       definition_B: a shop that sells cakes.
+       output: 0
+   jud_usr_prompt: >-
+     definition A: {first_definition} 
+     definition B: {second_definition}
+
+   jud_verify_prompt: >-
+     Your answer is not allowed. Please think again and only output 0 or 1. 
+
+   jud_temperature: 0.1  # temperature for this model. We expect the judge model output deterministic results, so we set temperature to 0.1.
+   jud_top_p: 0.6  # top_p for this model. The smaller the value, the more deterministic the model output is.
+   jud_max_tokens: 3  # We only need to output 1 or 0, so we set max_tokens to 5.
+   jud_bs: 24  # batch size for this model
+   dtype: auto  # https://docs.vllm.ai/en/latest/models/engine_args.html#cmdoption-dtype
+   jud_res_cache_file: jud_results.csv  # cache judgment results file
+   ver_res_cache_file: verify_results.csv  # the file for caching the judge results after verification. Each judge model will have a such file.
+   verify_convs_cache_file: verify_convs.csv  # the file for caching the verification conversations. Each judge model will have a such file.
+#  -
+#    name: Yi # The evaluation effect of Yi-6B-Chat is very poor
+#    checkpoint: ckpt/01-ai/Yi-6B-Chat  # https://huggingface.co/01-ai/Yi-6B-Chat
+#    # https://huggingface.co/01-ai/Yi-6B-Chat#perform-inference-with-yi-chat-model
+#    jud_usr_prompt: >-
+#      You are a professional and helpful English linguist.
+#      You diligently complete tasks as instructed.
+#      You are about to read two definitions (i.e., definition A and definition B), which are followed by examples and
+#      delimited by triple dashes (i.e., ---).
+#      Please judge whether two definitions have similar meanings or explaining a same noun word by performing the following actions:
+#      1) Think the first question carefully: Are the meanings of these two definitions similar?
+#      2) Think the second question carefully: Are the two definitions explaining a same noun?
+#      3) If you answer "Yes" to one of the above questions, only output 1; Otherwise, only output 0.
+#      4) Please note that expect for 0 or 1, all other text, punctuation, numbers, and whitespace characters are not allowed in the output.
+#
+#      ### Start examples
+#      definition A: Any great, strong, powerful emotion, especially romantic love or extreme hate.
+#      definition B: A passionate individual.
+#      0
+#
+#      definition A: A cargo ship or freighter is a merchant ship that carries cargo, goods, and materials from one port to another. Thousands of cargo carriers ply the world's seas and oceans each year, handling the bulk of international trade.
+#      definition B: Any vessel designed to carry cargo.
+#      1
+#
+#      definition A: A flammable liquid consisting of a mixture of refined petroleum hydrocarbons, mainly used as a motor fuel; petrol.
+#      definition B: Petroleum, a fluid consisting of a mixture of refined petroleum hydrocarbons, primarily consisting of octane, commonly used as a motor fuel.
+#      1
+#
+#      definition A: A shop or store that sells groceries; a grocery store.
+#      definition B: a shop that sells cakes.
+#      0
+#      ### End examples
+#
+#      ---
+#      definition A: {first_definition}
+#      definition B: {second_definition}
+#      ---
+#
+#    jud_verify_prompt: >-
+#      Your answer is not allowed. Please think again and only output 0 or 1.
+#
+#    jud_temperature: 0.1  # temperature for this model. We expect the judge model output deterministic results, so we set temperature to 0.1.
+#    jud_top_p: 0.6  # top_p for this model. The smaller the value, the more deterministic the model output is.
+#    jud_max_tokens: 3  # We only need to output 1 or 0, so we set max_tokens to 5.
+#    jud_bs: 24  # batch size for this model
+#    dtype: auto  # https://docs.vllm.ai/en/latest/models/engine_args.html#cmdoption-dtype
+#    jud_res_cache_file: jud_results.csv  # cache judgment results file
+#    ver_res_cache_file: verify_results.csv  # the file for caching the judge results after verification. Each judge model will have a such file.
+#    verify_convs_cache_file: verify_convs.csv  # the file for caching the verification conversations. Each judge model will have a such file.
+
+  # add more
+  # you can add more judgment models in the future in a form of the judge model configs like above
   # all keys in the judge model configs are required!
-
-# judge model configs
-Mistral:
-  # https://huggingface.co/mistralai/Mistral-7B-Instruct-v0.2
-  checkpoint: ckpt/Mistral-7B-Instruct-v0.2  # your path to the model checkpoint
-  # https://huggingface.co/mistralai/Mistral-7B-Instruct-v0.2#instruction-format
-  jud_usr_prompt: >-
-    You are a professional and helpful English linguist. 
-    You diligently complete tasks as instructed. 
-    You are about to read two definitions (i.e., definition A and definition B), which are followed by examples and 
-    delimited by triple dashes (i.e., ---). 
-    Please judge whether two definitions have similar meanings or explaining a same noun word by performing the following actions: 
-    1) Think the first question carefully: Are the meanings of these two definitions similar? 
-    2) Think the second question carefully: Are the two definitions explaining a same noun?  
-    3) If you answer "Yes" to one of the above questions, only output 1; Otherwise, only output 0.
-    4) Please note that expect for 0 or 1, all other text, punctuation, numbers, and whitespace characters are not allowed in the output.
-
-    ### Start examples
-    definition A: Any great, strong, powerful emotion, especially romantic love or extreme hate.
-    definition B: A passionate individual.
-    0
-
-    definition A: A cargo ship or freighter is a merchant ship that carries cargo, goods, and materials from one port to another. Thousands of cargo carriers ply the world's seas and oceans each year, handling the bulk of international trade.
-    definition B: Any vessel designed to carry cargo.
-    1
-  
-    definition A: A flammable liquid consisting of a mixture of refined petroleum hydrocarbons, mainly used as a motor fuel; petrol.
-    definition B: Petroleum, a fluid consisting of a mixture of refined petroleum hydrocarbons, primarily consisting of octane, commonly used as a motor fuel.
-    1
-  
-    definition A: A shop or store that sells groceries; a grocery store.
-    definition B: a shop that sells cakes.
-    0
-    ### End examples
-    
-    ---
-    definition A: {first_definition} 
-    definition B: {second_definition}
-    ---
-
-  jud_verify_prompt: >-
-    Your answer is not allowed. Please think again and only output 0 or 1.
-
-  jud_temperature: 0.1  # temperature for this model. We expect the judge model output deterministic results, so we set temperature to 0.1.
-  jud_top_p: 0.6  # top_p for this model. The smaller the value, the more deterministic the model output is.
-  jud_max_tokens: 3  # We only need to output 1 or 0, so we set max_tokens to 5.
-  jud_bs: 24  # batch size for this model
-  dtype: auto  # https://docs.vllm.ai/en/latest/models/engine_args.html#cmdoption-dtype
-  jud_res_cache_file: jud_results.csv  # cache judgment results file
-  ver_res_cache_file: verify_results.csv  # the file for caching the judge results after verification. Each judge model will have a such file.
-  verify_convs_cache_file: verify_convs.csv  # the file for caching the verification conversations. Each judge model will have a such file.
-
-#  ==========================================
-Qwen:
-  # https://huggingface.co/Qwen/Qwen1.5-14B-Chat
-  checkpoint: ckpt/Qwen/Qwen1.5-14B-Chat  # your path to the model checkpoint
-  # qwen has system prompt. We can input the examples in a form of chatting
-  # https://huggingface.co/Qwen/Qwen1.5-14B-Chat#quickstart
-  jud_sys_prompt: >-
-    You are a professional and helpful English linguist. 
-    You are about to read two definitions (i.e., definition A and definition B).
-    Please judge whether two definitions have similar meanings or explaining a same noun word by performing the following actions: 
-    1) Think the first question carefully: Are the meanings of these two definitions similar? 
-    2) Think the second question carefully: Are the two definitions explaining a same noun?  
-    3) If you answer "Yes" to one of the above questions, only output 1; Otherwise, only output 0.
-    4) Please note that expect for 0 or 1, all other text, punctuation, numbers, and whitespace characters are not allowed in the output.
-
-  # the examples can be input in a form of chatting
-  jud_examples:  # examples input in a form of chatting
-    -
-      definition_A: Any great, strong, powerful emotion, especially romantic love or extreme hate.
-      definition_B: A passionate individual.
-      output: 0
-    -
-      definition_A: A cargo ship or freighter is a merchant ship that carries cargo, goods, and materials from one port to another. Thousands of cargo carriers ply the world's seas and oceans each year, handling the bulk of international trade.
-      definition_B: Any vessel designed to carry cargo.
-      output: 1
-    -
-      definition_A: A flammable liquid consisting of a mixture of refined petroleum hydrocarbons, mainly used as a motor fuel; petrol.
-      definition_B: Petroleum, a fluid consisting of a mixture of refined petroleum hydrocarbons, primarily consisting of octane, commonly used as a motor fuel.
-      output: 1
-    -
-      definition_A: A shop or store that sells groceries; a grocery store.
-      definition_B: a shop that sells cakes.
-      output: 0
-  jud_usr_prompt: >-
-    definition A: {first_definition} 
-    definition B: {second_definition}
-
-  jud_verify_prompt: >-
-    Your answer is not allowed. Please think again and only output 0 or 1. 
-
-  jud_temperature: 0.1  # temperature for this model. We expect the judge model output deterministic results, so we set temperature to 0.1.
-  jud_top_p: 0.6  # top_p for this model. The smaller the value, the more deterministic the model output is.
-  jud_max_tokens: 3  # We only need to output 1 or 0, so we set max_tokens to 5.
-  jud_bs: 24  # batch size for this model
-  dtype: auto  # https://docs.vllm.ai/en/latest/models/engine_args.html#cmdoption-dtype
-  jud_res_cache_file: jud_results.csv  # cache judgment results file
-  ver_res_cache_file: verify_results.csv  # the file for caching the judge results after verification. Each judge model will have a such file.
-  verify_convs_cache_file: verify_convs.csv  # the file for caching the verification conversations. Each judge model will have a such file.
-
-# ==========================================
-Yi:  # The evaluation effect of Yi-6B-Chat is very poor
-  checkpoint: ckpt/01-ai/Yi-6B-Chat  # https://huggingface.co/01-ai/Yi-6B-Chat
-  # https://huggingface.co/01-ai/Yi-6B-Chat#perform-inference-with-yi-chat-model
-  jud_usr_prompt: >-
-    You are a professional and helpful English linguist. 
-    You diligently complete tasks as instructed. 
-    You are about to read two definitions (i.e., definition A and definition B), which are followed by examples and 
-    delimited by triple dashes (i.e., ---). 
-    Please judge whether two definitions have similar meanings or explaining a same noun word by performing the following actions: 
-    1) Think the first question carefully: Are the meanings of these two definitions similar? 
-    2) Think the second question carefully: Are the two definitions explaining a same noun?  
-    3) If you answer "Yes" to one of the above questions, only output 1; Otherwise, only output 0.
-    4) Please note that expect for 0 or 1, all other text, punctuation, numbers, and whitespace characters are not allowed in the output.
-
-    ### Start examples
-    definition A: Any great, strong, powerful emotion, especially romantic love or extreme hate.
-    definition B: A passionate individual.
-    0
-
-    definition A: A cargo ship or freighter is a merchant ship that carries cargo, goods, and materials from one port to another. Thousands of cargo carriers ply the world's seas and oceans each year, handling the bulk of international trade.
-    definition B: Any vessel designed to carry cargo.
-    1
-
-    definition A: A flammable liquid consisting of a mixture of refined petroleum hydrocarbons, mainly used as a motor fuel; petrol.
-    definition B: Petroleum, a fluid consisting of a mixture of refined petroleum hydrocarbons, primarily consisting of octane, commonly used as a motor fuel.
-    1
-
-    definition A: A shop or store that sells groceries; a grocery store.
-    definition B: a shop that sells cakes.
-    0
-    ### End examples
-
-    ---
-    definition A: {first_definition} 
-    definition B: {second_definition}
-    ---
-
-  jud_verify_prompt: >-
-    Your answer is not allowed. Please think again and only output 0 or 1. 
-
-  jud_temperature: 0.1  # temperature for this model. We expect the judge model output deterministic results, so we set temperature to 0.1.
-  jud_top_p: 0.6  # top_p for this model. The smaller the value, the more deterministic the model output is.
-  jud_max_tokens: 3  # We only need to output 1 or 0, so we set max_tokens to 5.
-  jud_bs: 24  # batch size for this model
-  dtype: auto  # https://docs.vllm.ai/en/latest/models/engine_args.html#cmdoption-dtype
-  jud_res_cache_file: jud_results.csv  # cache judgment results file
-  ver_res_cache_file: verify_results.csv  # the file for caching the judge results after verification. Each judge model will have a such file.
-  verify_convs_cache_file: verify_convs.csv  # the file for caching the verification conversations. Each judge model will have a such file.
-
-
-# ==========================================
-# add more

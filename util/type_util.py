@@ -168,21 +168,36 @@ def del_none(in_file, out_file):
                 writer.write(obj)
                 count += 1
 
-def get_best_definition(in_file, out_file):
+def get_best_definition(in_file, out_file, **kwargs):
     """
     read the `in_file` and get the best definition of each type word, output to the `out_file`.
     :param in_file:
     :param out_file:
+    :param kwargs:
+        1) checkpoint: the LLM checkpoint used to judge. model_name or path.
+        2) sys_prompt: (Optional) prompt for the judge model. It is used as the 'system' role of the chat message.
+        3) examples: (Optional) examples for the judge model to generate the chat message. It is used as the 'user' and 'assistant' role of the chat message.
+        5) jud_verify_prompt: prompt for the judge model to verify the answer.  We need to continue the conversation to
+            ask for the correct answer
+        6) temperature: temperature for the judge model. Default is 0.
+        7) top_p: top_p for the judge model. he smaller the value, the more deterministic the model output is.
+        8) max_tokens: The maximum number of tokens to generate.
+        9) bs: batch size for the LLM.
+        10) dtype: The data type of the input tensor. https://docs.vllm.ai/en/latest/models/engine_args.html#cmdoption-dtype
+        11) jud_res_cache_file: the file to cache the judge results.
+        12) ver_res_cache_file: the file to cache the judge results after verification.
+        13) verify_convs_cache_file: the file to cache the verification conversations.
     :return:
     """
     # todo,在这里实现获取每个type word的最佳定义。大模型判断。
+    for model_name in kwargs['def_models']:
+        pass
 
-def judge_by_llm(work_dir, jud_model_name, clusters, input_type_info, defi_word_id_pair, device_ids, **kwargs):
+def judge_by_llm(work_dir, clusters, input_type_info, defi_word_id_pair, device_ids, **kwargs):
     """
     Judge the similarity of the definitions in each cluster by LLMs and remove the redundant definitions from each cluster.
 
     :param work_dir: The work directory for this judge model.
-    :param jud_model_name: the judge model we choose to judge.
     :param clusters: The clusters of the definitions of the type words. Each cluster is a list of dict, where each dict
         contains the id of the definition and the definition.
     :param input_type_info: The information of the type words. It's a dict, where the key is the id of the type word and
@@ -206,6 +221,7 @@ def judge_by_llm(work_dir, jud_model_name, clusters, input_type_info, defi_word_
         13) verify_convs_cache_file: the file to cache the verification conversations.
     :return: List[int], The redundant definitions' ids.
     """
+    jud_model_name = kwargs['name']
     print("="*20 + f"Start to judge by LLMs: {jud_model_name}" + "="*20)
     out_dir = os.path.join(work_dir, jud_model_name)  # the output directory of this judge model
     if not os.path.exists(out_dir):
@@ -404,8 +420,9 @@ def disambiguate_type_word(in_file, out_file, cuda_devices, **kwargs):
         os.environ["CUDA_VISIBLE_DEVICES"] = ','.join(cuda_devices)
     else:
         os.environ["CUDA_VISIBLE_DEVICES"] = cuda_devices
-        device_ids = [int(i) for i in ','.split(cuda_devices)]
-    device = torch.device("cuda:0")  # set the main GPU device
+        device_ids = [int(i) for i in cuda_devices.split(',')]
+    main_device = str(device_ids[0])
+    device = torch.device(f"cuda:{main_device}")  # set the main GPU device
 
     # 1. Preprocess the definitions of the input type words
     # 2.1 get type words' definitions
@@ -482,12 +499,11 @@ def disambiguate_type_word(in_file, out_file, cuda_devices, **kwargs):
 
    # 3. judge by LLMs. We use vLLM for faster inference
     redundant_id = []
-    for jud_model_name in kwargs['jud_models']:
+    for jud_model_cfg in kwargs['jud_models']:
         # kwargs['work_dir'] is the work directory
         # kwargs[jud_model] is the config of the judge model
-        redt_id_from_this_model = judge_by_llm(kwargs['work_dir'],jud_model_name, clusters,
-                                               input_type_info,defi_word_id_pair, device_ids,
-                                               **kwargs[jud_model_name])
+        redt_id_from_this_model = judge_by_llm(kwargs['work_dir'], clusters,input_type_info,
+                                               defi_word_id_pair, device_ids, **jud_model_cfg)
         redundant_id += redt_id_from_this_model
 
     # 4 filter and output the result
