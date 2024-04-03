@@ -1,18 +1,23 @@
+import re
+import json
 import torch
 import spacy
 import stanza
 import os
-import yaml
 import multiprocess
 import jsonlines
+import shutil
+import copy
+import wandb
+import numpy as np
 
+from datasets import Dataset
+from vllm import LLM, SamplingParams
 from nltk.tree import Tree
 from datasets import load_dataset, concatenate_datasets
-from yaml.loader import SafeLoader
-from typing import List
 from tqdm import tqdm
 from util.type_util import get_type_word, del_none, disambiguate_type_word, TypeWord
-
+from util.func_util import get_config, batched, eval_anno_quality
 
 class Processor:
     """
@@ -22,18 +27,22 @@ class Processor:
         3) process the dataset in each stage
     """
     def __init__(self, config_file):
-        with open(config_file, 'r') as f:
-            self.config = yaml.load(f, Loader=SafeLoader)
-        self.num_shards = self.config['num_shards']
+        self.config = get_config(config_file)
         self.cuda_devices = self.config['cuda_devices']
         self.data_dir = self.config['data_dir']
 
+
         # store type information
-        self.type_info = dict()
+        self.type_num = 0  # total number of type words
+        self.type_words = []  # a list to store type words, just their literal values
+        self.type_info = dict()  # a dict to store all type information. key: type word, value: TypeWord object
+        self.type2id = dict()  # a dict to store the mapping from type word to its id
+        self.id2type = dict()  # a dict to store the mapping from id to type word
 
     @staticmethod
-    def __merge_compound_words(sents: List[List[str]]) -> List[str]:
+    def _merge_compound_words(sents: list[list[str]]) -> list[str]:
         """
+        Used in stage1.
         1. Some compound words formed by hyphen ('-') had been split into several words, we need to merge them into a
             single word.
             e.g., ['United', '-', 'States'] -> ['United-States'], ['the', 'Semi-', 'finals'] -> ['the Semi-finals']
@@ -83,8 +92,9 @@ class Processor:
         return list(set(new_sents))  # remove duplicates
 
     @staticmethod
-    def __modify_spacy_tokenizer(nlp):
+    def _modify_spacy_tokenizer(nlp):
         """
+        Used in stage1.
         Modify the spaCy tokenizer to prevent it from splitting on '-' and '/'.
         Refer to https://spacy.io/usage/linguistic-features#native-tokenizer-additions
 
@@ -113,8 +123,9 @@ class Processor:
         return nlp
 
     @staticmethod
-    def __replace_special_tokens(sent: str) -> str:
+    def _replace_special_tokens(sent: str) -> str:
         """
+        Used in stage1.
         Replace special tokens with original characters.
         e.g., '-LRB-' -> '(', '-RRB-' -> ')', '-LSB-' -> '[', '-RSB-' -> ']'
 
@@ -135,30 +146,30 @@ class Processor:
         """
         To build type information of the UFER dataset, we need to do 4 things.
 
-        First, get type word (including its definition) according to the original type vocabulary. The result will be stored in the 'cache_info.jsonl' file.
+        First, get type word (including its definition) according to the original type words. The result will be stored in the 'cache_info_file_0' file.
 
         Second, we should manually :
             1) (carefully) For those words that cannot be found in the dictionary api and Wikipedia,
-                we need to search the definitions of those words from other sources and  update the 'cache_info.jsonl' file.
+                we need to search the definitions of those words from other sources and  update the 'cache_info_file_0' file.
                 Some words may not have a suitable definition, and we label their definitions as 'None'.
             2) (roughly) Check for words that is not suitable as a category, and we label their definitions as 'None'.
             3) (roughly) Check for redundant words (i.e., words with similar definition already exist), and we label
                 redundant words' definitions as 'None'.
 
-        Third, remove the words with the definition 'None'.
+        Third, remove the words with the definition 'None'. The result will be stored in the 'cache_info_file_1' file.
 
-        Forth, remove similar meanings using Clustering and LLMs.
+        Forth, remove similar meanings using Clustering and LLMs. The result will be stored in the 'cache_info_file_2' file.
         :param cache_stage: The stage of the cache file. We use this param to control the building process.
             1) 0: no cache file, we should build from scratch;
             2) 1: cache file with 'None' removed, skip the first step;
             3) 2: cache file after meaning disambiguation, skip the first two steps.
         """
         assert cache_stage in [0, 1, 2], f"cache_stage must be one of (0, 1, 2)!"
-        type_cfg = self.config['type_cfg']  # get type configuration
+        type_cfg = get_config(self.config['type'])  # get type configuration
         work_dir = type_cfg['work_dir']  # get the work directory
-        original_type_vocab = os.path.join(work_dir, type_cfg['original_type_vocab'])
+        original_type_words = os.path.join(work_dir, type_cfg['original_type_words'])
 
-        # 1. First, get type word (including its definition) according to the original type vocabulary
+        # 1. First, get type word (including its definition) according to the original type words
         cache_info_file_0 = os.path.join(work_dir, type_cfg['cache_info_file_0'])
         if cache_stage == 0:
             print("=" * 20 + " Building type information of the UFER dataset " + "=" * 20)
@@ -173,7 +184,7 @@ class Processor:
                     start_id = len(lines)
                     print(f'{start_id} type words have been gotten. We continue build process from the {start_id+1}-th type word')
 
-            with open(original_type_vocab, 'r') as reader, jsonlines.open(cache_info_file_0, 'a') as writer:
+            with open(original_type_words, 'r') as reader, jsonlines.open(cache_info_file_0, 'a') as writer:
                 for idx, line in enumerate(tqdm(reader.readlines(), desc='building type info...')):
                     if idx < start_id:  # Skip type information that has been established
                         continue
@@ -202,6 +213,7 @@ class Processor:
             cache_stage += 1
 
         cache_info_file_2 = os.path.join(work_dir, type_cfg['cache_info_file_2'])
+        type_info_file = os.path.join(work_dir, type_cfg['type_info_file'])
         if cache_stage == 2:
             # 4. Forth, remove similar meanings using Clustering and LLMs.
             print("Remove similar meanings using Clustering and LLMs.")
@@ -211,6 +223,7 @@ class Processor:
                                    **type_cfg)  # type_cfg is the type configuration
             print("Building type information of the UFER dataset Done!")
 
+        shutil.copyfile(cache_info_file_2, type_info_file)
         return cache_info_file_2
 
     def get_type_info(self, type_info_file=None):
@@ -219,24 +232,86 @@ class Processor:
 
         :param type_info_file: The file to store type information. If None, we will use the default file in the config file.
         """
-        type_cfg = self.config['type_cfg']
+        type_cfg = get_config(self.config['type'])
 
-        self.type_info['type_num'] = 0  # total number of type words
-        self.type_info['type_vocab'] = []  # a list to store type words, just their literal values
-        self.type_info['type_words_dict'] = dict()  # # a dict to store all type information. key: type word, value: TypeWord object
-        self.type_info['type_words_list'] = []  # a Sequence to store all type information. Each element is a TypeWord object
-
+        # write the type words to the type_words file
+        type_words_file = os.path.join(type_cfg['work_dir'], type_cfg['type_words_file'])
         if type_info_file is None:
             type_info_file = type_cfg['type_info_file']
-        with jsonlines.open(type_info_file,'r') as reader:
+        with jsonlines.open(type_info_file,'r') as reader, open(type_words_file, 'w') as f:
             for line in tqdm(reader, desc='get type info...'):
                 type_word_obj = TypeWord(**line)
-                type_word = line['word']
-                self.type_info['type_num'] += 1
-                self.type_info['type_vocab'].append(type_word)
-                self.type_info['type_words_dict'].update({type_word: type_word_obj})
-                self.type_info['type_words_list'].append(type_word_obj)
+                self.type_num += 1
+                self.type_words.append(type_word_obj.word)
+                self.type_info.update({type_word_obj.word: type_word_obj})
+                self.id2type.update({type_word_obj.id: type_word_obj.word})
+                self.type2id.update({type_word_obj.word: type_word_obj.id})
+                f.write(type_word_obj.word + '\n')
         print('Get type information done!')
+
+    def _prep_cand_type_words_for_stage2(self, candidate_type_words_nums=5, candidate_type_words_template=None):
+        """
+        Used before stage2.
+        Prepare the candidate type words input to prompts.
+
+        :param candidate_type_words_nums: The number of candidate type words with definitions input to prompts
+        :param candidate_type_words_template: The template for candidate type words
+        :return:
+        """
+        # a Sequence to store all type information.
+        # Each element is dict in a form of {'id': id of this element, 'word': type word, 'definition': one of the definitions of the type word}
+        candidate_type_words = []
+        candidate_id = 0
+        for type_word_obj in self.type_info.values():
+            for defi in type_word_obj.definitions:
+                candidate_type_words.append({'id': candidate_id, 'word': type_word_obj.word, 'definition': defi})
+                candidate_id += 1
+
+        batch_cand_type_words = []
+        for batch_cad_ty_words in batched(candidate_type_words, candidate_type_words_nums):
+            # ['id': 0, 'word': x0, 'definition': xx', 'id': 1, 'word': x1, 'definition': xx']
+            # -> '<id>: 0, <word>: x0, <definition>: xx <id>: 1, <word>: x1, <definition>: xx'
+            tmp = [candidate_type_words_template.format(id=e['id'], word=e['word'], definition=e['definition']) for e in batch_cad_ty_words]
+            batch_cand_type_words.append('\n'.join(tmp))
+        return candidate_type_words, batch_cand_type_words
+
+    @staticmethod
+    def _init_chat_message_for_stage2(anno_model_name: str, **anno_model_kwargs) -> list[None|dict[str,str]]:
+        """
+        Used before stage2.
+        Init the chat messages for the annotation models.
+
+        :param anno_model_name: The name of the annotation model used in the stage2.
+        :param anno_model_kwargs: The parameters of the annotation model.
+        :return:
+        """
+        if anno_model_name == 'Qwen':
+            # for Qwen and Yi-ft, we need to input the system's prompt and the user's prompt
+            # https://huggingface.co/Qwen/Qwen1.5-72B-Chat-GPTQ-Int8
+            # https://huggingface.co/TheBloke/nontoxic-bagel-34b-v0.2-GPTQ
+            chat_message = [
+                {"role": "system", "content": anno_model_kwargs['anno_sys_prompt_batch']},
+            ]
+            for example in anno_model_kwargs['anno_examples_batch']:
+                usr_content = anno_model_kwargs['anno_usr_prompt_batch'].format(sentence=example['sentence'],
+                                                                                candidate_type_words=example['candidate_type_words'])
+                chat_message.append({"role": "user", "content": usr_content})
+                chat_message.append({"role": "assistant", "content": example['output']})
+        else:
+            # e.g., for mistral and Yi, we only need to input the user's prompt
+            chat_message = []
+        return chat_message
+
+    @staticmethod
+    def _eval_anno_quality(instances, sub_field):
+        """
+        Evaluate the quality of annotations.
+
+        :param instances: Dict[str, List], a list of instances.
+        :param sub_field: the subject filed in instances
+        :return:
+        """
+        pass
 
 
     def pre_process(self):
@@ -250,7 +325,7 @@ class Processor:
         print("="*20 + " Pre-processing " + "="*20)
 
         # 1. init
-        preprocess_cfg = self.config['preprocess']
+        preprocess_cfg = get_config(self.config['preprocess'])
         in_dirs = preprocess_cfg['in_dirs']
         out_dir = preprocess_cfg['out_dir']
         if not os.path.exists(out_dir):
@@ -283,12 +358,15 @@ class Processor:
                 writer.write({'sentence': sent})
         print("=" * 20 + " Pre-processing Done " + "=" * 20)
 
+    def post_process(self):
+        pass
+
     def stage1(self, instances, rank = 0, **kwargs):
         """
         Stage1, filter short sentences, get noun phrase (NP) spans and named entity (NE) spans in sentences. English only.
         In this stage, we get flat spans by spaCy. Meanwhile, we get nested spans by spaCy and Stanza.
 
-        :param instances: A batch of instances.
+        :param instances: Dict[str, List], A batch of instances.
         :param rank: The rank of the current process. It will be automatically assigned a value when multiprocess is
             enabled in the map function.
         :param kwargs:
@@ -303,6 +381,7 @@ class Processor:
         :return:
         """
 
+        # 0. GPU setting for stage1
         if self.cuda_devices == 'all':
             # set the GPU can be used by stanza in this process
             os.environ["CUDA_VISIBLE_DEVICES"] = str(rank % torch.cuda.device_count())
@@ -320,7 +399,7 @@ class Processor:
 
         # load a spaCy and a stanza model in each process
         spacy_nlp = spacy.load(name = kwargs['spacy_model']['name'])
-        spacy_nlp = self.__modify_spacy_tokenizer(spacy_nlp)  # modify the spaCy tokenizer
+        spacy_nlp = self._modify_spacy_tokenizer(spacy_nlp)  # modify the spaCy tokenizer
         stanza_nlp = stanza.Pipeline(**kwargs['stanza_model'], download_method=None)
 
         sentences, out_sentences, out_spans = [], [], []
@@ -345,10 +424,10 @@ class Processor:
             # e.g., ['United', '-', 'States'] -> ['United-States']
             # Also, some fractions or ratio will be separated by spaces, we need to merge them together.
             # e.g., ['3', '/', '4ths', 'to', '9' , '/', '10ths'] -> ['3/4ths', 'to', '9/10ths']
-            batch_texts = self.__merge_compound_words(batch_texts)
+            batch_texts = self._merge_compound_words(batch_texts)
 
             # 1.4. replace special tokens with original characters
-            batch_texts = [self.__replace_special_tokens(sent) for sent in batch_texts]
+            batch_texts = [self._replace_special_tokens(sent) for sent in batch_texts]
 
             # 2. process by 2 parsers
             # refer to
@@ -407,7 +486,7 @@ class Processor:
                 # However, as mentioned before, the compound words formed by hyphen (-) will be split into several
                 # words by stanza. So we need to combine them back into a single word.
                 # e.g., ['United', '-', 'States'] -> ['United-States']
-                new_subtrees = self.__merge_compound_words(subtrees)
+                new_subtrees = self._merge_compound_words(subtrees)
 
                 # We initiate the start character index and end character index with -1.
                 # And the data format is a dict, where the key is the text of the NP span (to remove duplicates),
@@ -430,7 +509,7 @@ class Processor:
                     # stanza will replace some special characters with special tokens, e.g., '(' -> '-LRB-', '[' -> '-LSB-'
                     # We need to replace them back to the original characters.
                     # But we need to use escape character in the regular expression.
-                    span_text = self.__replace_special_tokens(span_text)
+                    span_text = self._replace_special_tokens(span_text)
 
                     if start_ch_idx == -1 and end_ch_idx == -1:  # -1 means the start/end character index is not available
                         # Find the start character index and end character index of the first matched NP/NE span.
@@ -478,26 +557,163 @@ class Processor:
             'span': out_spans,
         }
 
-    def stage2(self, instances, rank = 0, **kwargs):
+    def stage2(self, instances, **kwargs):
         """
         Stage2, annotate the given entity mention  in the instances.
 
-        :param instances:
-        :param rank:
+        :param instances: Dict[str, List], A batch of instances. In stage2, it is a dataset shard.
         :param kwargs:
+            1) shard_idx: The index of the shard.
+            2) out_dir: The output directory.
+            3) candidate_type_words: the candidate type words with definitions. Each element is a dict in a form of '{id: x, word: xx, definition: xxx}'
+            4) batch_cand_type_words: the batched candidate type words. Each element is a string composed of a batch of candidate type words.
+            chat_message_templates: the chat message template for each annotating model
         :return:
         """
+        # init wandb
+
+        wandb.init(
+            project='UFER',
+            config=kwargs
+        )
+
         # 0. GPU setting
+        os.environ['TOKENIZERS_PARALLELISM'] = 'false'  # avoid parallelism in tokenizers
+        # set GPU device
         if self.cuda_devices == 'all':
-            # set the GPU can be used by stanza in this process
-            os.environ["CUDA_VISIBLE_DEVICES"] = str(rank % torch.cuda.device_count())
-
+            # set the GPU can be used
+            cuda_devices = [str(i) for i in range(torch.cuda.device_count())]
+            os.environ["CUDA_VISIBLE_DEVICES"] = ','.join(cuda_devices)
         else:
-            cuda_devices = str(self.cuda_devices).split(',')
-            gpu_id = rank % len(cuda_devices)
-            os.environ["CUDA_VISIBLE_DEVICES"] = str(cuda_devices[gpu_id])
+            os.environ["CUDA_VISIBLE_DEVICES"] = self.cuda_devices
+        gpu_num = len(os.environ["CUDA_VISIBLE_DEVICES"].split(','))
 
-        # todo: add your code here
+        # 1. prepare the chat message
+        def _generate_chat_messages(instances, anno_model_name):
+            """
+            Generate chat messages for each instance. Meanwhile, init the labels for each instance.
+
+            :param instances: The instances to be annotated.
+            :param anno_model_name: The name of the annotating model.
+            :return:
+            """
+            for sent_id, (sentence, span) in enumerate(zip(instances['sentence'], instances['span'])):
+                # span is the NP/NE spans in the sentence
+                # e.g. [["14","17","a big ship"],["0","2","Emerald Princess"],["13","14","she"],["2","5","The Emerald Princess"],["7","10","Saturday 5th May"]]
+                instances[f'{anno_model_name}_labels'].append([])  # init labels annotated by each annotating model
+                instances[f'{anno_model_name}_label_ids'].append([])  # init label ids annotated by each annotating model
+                # instances[f'{anno_model_name}_anwsers'].append([])  # init answer output by each annotating model
+
+                for span_id, (start, end, entity_mention) in enumerate(tuple(span)):
+                    start, end = int(start), int(end)
+                    sent = sentence.split(' ')
+                    sentence = ' '.join(sent[:start] + ['[e]', entity_mention, '[/e]'] + sent[end:])
+                    instances[f'{anno_model_name}_labels'][sent_id].append(set())  # init labels for each entity mention
+                    instances[f'{anno_model_name}_label_ids'][sent_id].append(set())  # init label ids for each entity mention
+                    # instances[f'{anno_model_name}_anwsers'][sent_id].append(set())  # init answer output for each entity mention
+
+                    for b_c_t_words in kwargs['batch_cand_type_words']:
+                        chat_message = copy.deepcopy(kwargs['chat_message_templates'][anno_model_name])
+                        usr_content = anno_model_kwargs['anno_usr_prompt_batch'].format(sentence=sentence, candidate_type_words=b_c_t_words)
+                        chat_message.append({"role": "user", "content": usr_content})
+                        yield sent_id, span_id, chat_message  # yield chat message, the ID of the sentences it contains and the ID of the entity mention it contains
+
+        # 2. annotate entity type by multiple LLMs.
+        for anno_model_name in kwargs['anno_models']:
+            instances.update({f'{anno_model_name}_labels': []})  # store type words annotated by each annotating model
+            instances.update({f'{anno_model_name}_label_ids': []})  # store type word ids  annotated by each annotating model
+            # instances.update({f'{anno_model_name}_anwsers': []})  # store the answer output by each annotating model
+            print("=" * 20 + f'Start to be annotated by {anno_model_name} ' + "=" * 20)
+
+            # 1.1 Check if there is a cached annotation result file
+            out_dir = kwargs['out_dir']  # output directory
+            shard_idx = kwargs['shard_idx']  # the id of the dataset shard being processed
+            shard_out_file = os.path.join(out_dir, f'{anno_model_name}/datasets_shard_{shard_idx}.jsonl')
+            if os.path.exists(shard_out_file):
+                print(f'{shard_out_file} already exists! Skip annotate dataset shard {shard_idx} by {anno_model_name}')
+                continue
+
+            # 1.2 Import the annotating model
+            # https://docs.vllm.ai/en/latest/getting_started/quickstart.html
+            anno_model_kwargs = kwargs[anno_model_name]  # the parameters of the annotation model
+            anno_model = LLM(model=anno_model_kwargs['checkpoint'], tensor_parallel_size=gpu_num, dtype=anno_model_kwargs['dtype'])
+            sampling_params = SamplingParams(temperature=anno_model_kwargs['anno_temperature'],
+                                             top_p=anno_model_kwargs['anno_top_p'],
+                                             max_tokens=anno_model_kwargs['anno_max_tokens'])
+
+            # get anno_model's tokenizer to apply the chat template
+            # https://github.com/vllm-project/vllm/issues/3119
+            anno_tokenizer = anno_model.llm_engine.tokenizer.tokenizer
+
+            # 1.3 batch process
+            num_shards = kwargs['num_shards']
+            pbar = tqdm(batched(_generate_chat_messages(instances, anno_model_name), anno_model_kwargs['anno_bs']),
+                        desc=f'annotating shards {shard_idx}/{num_shards}')
+            num_spans = 0  # store the number of spans in the dataset shard
+            json_pattern = r'\{.*?\}'  # the pattern to extract JSON string
+            for batch in pbar:  # batch is a tuple like ((sent_id_0, span_id_0, chat_0),(sent_id_1, span_id_1, chat_1)...)
+                batch_sent_ids, batch_span_ids, batch_chats = [], [], []
+                for sent_id, span_id, chat in batch:
+                    batch_sent_ids.append(sent_id)
+                    batch_span_ids.append(span_id)
+                    batch_chats.append(chat)
+                num_spans += len(batch_span_ids)
+                # we should use tokenizer.apply_chat_template to add generation template to the chats explicitly
+                templated_batch_chats = anno_tokenizer.apply_chat_template(batch_chats, add_generation_prompt=True, tokenize=False)
+                outputs = anno_model.generate(templated_batch_chats, sampling_params)  # annotate
+                # for test
+                test_answer = []
+                for output in outputs:
+                    test_answer.append({'prompt': output.prompt, 'output': output.outputs[0].text})
+                for sent_id, span_id, output in zip(batch_sent_ids, batch_span_ids, outputs):
+                    # extract JSON string from output.outputs[0].text
+                    # out_answer is a string like '2782, 2783, 2788'
+                    results = re.findall(json_pattern, output.outputs[0].text, re.DOTALL)[0]  # only extract the first JSON string
+                    out_answer = json.loads(results)['answer']
+                    out_answer = out_answer.strip().split(',')
+                    if len(out_answer) == 1 and int(out_answer[0]) == -1:
+                        # if the model cannot find a suitable type word in this batch of candidate type words,
+                        # we should continue
+                        continue
+                    labels, label_ids = [], []
+                    for e in out_answer:
+                        type_word = kwargs['candidate_type_words'][int(e)]
+                        labels.append(type_word['word'])
+                        label_ids.append(self.type2id[type_word['word']])
+                    instances[f'{anno_model_name}_labels'][sent_id][span_id].update(labels)
+                    instances[f'{anno_model_name}_label_ids'][sent_id][span_id].update(label_ids)
+                    # instances[f'{anno_model_name}_anwsers'][sent_id][span_id].update(out_answer)
+                break
+
+            # 1.4 cache the annotation result of each annotating model
+            cached_instances = {
+                'sentence': instances['sentence'],
+                'span': instances['span'],
+                'labels': instances[f'{anno_model_name}_labels'],
+                'label_ids': instances[f'{anno_model_name}_label_ids'],
+                # 'anwsers': instances[f'{anno_model_name}_anwsers'],
+            }
+            Dataset.from_dict(cached_instances).to_json(shard_out_file)
+
+        # 2. evaluate the annotation quality of this shard
+        # 2.1 prepare the evaluation data containing category assignment with subjects in rows and annotators in columns.
+        # https://www.statsmodels.org/stable/generated/statsmodels.stats.inter_rater.aggregate_raters.html#
+        # For evaluation on multi-label annotation, we cast multi-label (N types) into N binary-classification for each span.
+        # And then, calculate the inter-annotator agreement (IAA). i.e., Fleiss' Kappa, Krippendorff's Alpha, etc.
+        num_anno_models = len(kwargs['anno_models'])
+        eval_data = np.zeros((num_spans * self.type_num, num_anno_models), dtype=np.int8)
+        span_id = -1  # the ID of the span
+        for model_id, anno_model_name in enumerate(kwargs['anno_models']):
+            for sent_spans_labels in instances[f'{anno_model_name}_label_ids']:  # e.g., sent_spans_labels=[[1,2], [3,4], [5,6]]
+                span_id += 1
+                for span_labels in sent_spans_labels:  # e.g., span_labels=[1,2]
+                    for label in span_labels:  # e.g., label=1
+                        eval_data[span_id * self.type_num + label, model_id] = 1
+
+        # 2.2 evaluate the annotation quality
+        qual_res = eval_anno_quality(eval_data, metric='fleiss_kappa')
+        wandb.log(qual_res)
+        return instances
 
     def process(self, stage):
         """
@@ -508,23 +724,39 @@ class Processor:
         """
         # set 'spawn' start method in the main process
         # refer to https://huggingface.co/docs/datasets/process#map
-        print("=" * 20 + f" Processing f{stage} " + "=" * 20)
+        print("=" * 20 + f" Processing {stage} " + "=" * 20)
         multiprocess.set_start_method('spawn')
 
-        # 1. init stage config to get fn_kwargs
-        stage_cfg = self.config[stage]
+        # 1. init stage config
+        stage_cfg = get_config(self.config[stage])
         in_dir = stage_cfg['in_dir']
         out_dir = os.path.join(self.data_dir, stage)
+        out_dir = os.path.join(out_dir, stage_cfg['mode'])
         if stage == 'stage1':
             process_func = self.stage1 # Specify the function to be used in the given stage.
-            out_dir = os.path.join(out_dir, stage_cfg['mode'])
+            batch_size = stage_cfg['batch_size_per_device'] * stage_cfg['batch_num_per_device']
+            if not os.path.exists(out_dir):  # out_dir/mode/
+                os.makedirs(out_dir)
 
         elif stage == 'stage2':
             process_func = self.stage2
-            out_dir = os.path.join(out_dir, stage_cfg['annotate_model'])
+            batch_size = None  # we do not need to specify batch_size in stage2, just input the whole dataset shards.
+            in_dir = os.path.join(in_dir, stage_cfg['mode'])  # in stage2, we need to specify the input mode
+            stage_cfg.update({'out_dir': out_dir})  # in stage2, we need to specify the output directory
 
-        if not os.path.exists(out_dir):
-            os.makedirs(out_dir)
+            # prepare the candidate type words input to prompts
+            candidate_type_words, batch_cand_type_words = self._prep_cand_type_words_for_stage2(stage_cfg['candidate_type_words_nums'],
+                                                                                     stage_cfg['candidate_type_words_template'])
+            stage_cfg.update({'candidate_type_words': candidate_type_words})
+            stage_cfg.update({'batch_cand_type_words': batch_cand_type_words})
+
+            # init output dir and the chat messages for each annotation model
+            stage_cfg.update({'chat_message_templates': dict()})  # store the chat message templates for the annotation models
+            for anno_model_name in stage_cfg['anno_models']:
+                out_dir_model = os.path.join(out_dir, anno_model_name)  # out_dir/mode/annt_model_name/
+                if not os.path.exists(out_dir_model):
+                    os.makedirs(out_dir_model)
+                stage_cfg['chat_message_templates'][anno_model_name] = self._init_chat_message_for_stage2(anno_model_name, **stage_cfg[anno_model_name])
 
         # 2. process each file in the given directory
         for path, dir_lst, file_lst in os.walk(in_dir):
@@ -547,22 +779,24 @@ class Processor:
                 dataset = dataset['train']
 
                 # 2.2. shard the large dataset into num_shards pieces, and process one piece at a time
+                # https://huggingface.co/docs/datasets/process#shard
                 processed_datasets = []
-                for idx in range(self.num_shards):
-                    print("="*20  + f'Processing shard {idx+1}/{self.num_shards} ' + "="*20)
-                    sub_dataset = dataset.shard(num_shards = self.num_shards, index = idx, contiguous=True)
-
+                num_shards = stage_cfg['num_shards']
+                for shard_idx in range(num_shards):
+                    print("=" * 20 + f'Processing shard {shard_idx}/{num_shards} ' + "=" * 20)
+                    sub_dataset = dataset.shard(num_shards=num_shards, index=shard_idx, contiguous=True)
+                    stage_cfg.update({'shard_idx': shard_idx})  # update the shard index
                     # 2.3. process the dataset
                     # https://huggingface.co/docs/datasets/process#map
                     # https://huggingface.co/docs/datasets/v2.15.0/en/package_reference/main_classes#datasets.Dataset.map
                     sub_dataset = sub_dataset.map(process_func,
-                                          fn_kwargs = stage_cfg,  # kwargs for process_func
-                                          batched = True,
-                                          with_rank = True,
-                                          batch_size = stage_cfg['batch_size_per_device'] * stage_cfg['batch_num_per_device'],
-                                          num_proc = stage_cfg['num_workers'],
-                                          remove_columns = dataset.column_names,  # Remove unnecessary columns from the original dataset
-                                          )
+                                                  fn_kwargs = stage_cfg,  # kwargs for process_func
+                                                  batched = True,
+                                                  with_rank = stage_cfg['with_rank'],
+                                                  batch_size = batch_size,
+                                                  num_proc = stage_cfg['num_workers'],
+                                                  remove_columns = dataset.column_names,  # Remove unnecessary columns from the original dataset
+                                                  )
                     processed_datasets.append(sub_dataset)
 
                 # 3. save the processed dataset
@@ -581,11 +815,22 @@ def main():
     config_file = r'config.yml'
     processor = Processor(config_file)
 
-    # 1. build type information first
-    type_info_file = processor.build_type_info(cache_stage=2)  # return the type information after disambiguation
-    processor.get_type_info(type_info_file)  # 2. then, get type information
-    # processor.pre_process()  # 3. pre-process the data
-    # processor.process('stage1')  # 4. stage1, filter short sentences, get NP spans and NE spans in sentences. English only.
+    # 1. pre-process the data
+    # processor.pre_process()
+
+    # 2. stage1, filter short sentences, get NP spans and NE spans in sentences. English only.
+    # processor.process('stage1')
+
+    # 3. build type information first
+    type_cfg = get_config(processor.config['type'])
+    type_work_dir = type_cfg['work_dir']
+    type_info_file = os.path.join(type_work_dir, type_cfg['type_info_file'])
+    if not os.path.exists(type_info_file):
+        type_info_file = processor.build_type_info(cache_stage=2)  # return the type information after disambiguation
+    processor.get_type_info(type_info_file)
+
+    # 4. stage2, annotate the given entity mention in the instances by multiple LLMs.
+    processor.process('stage2')
 
 if __name__ == '__main__':
     main()

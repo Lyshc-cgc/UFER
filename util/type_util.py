@@ -38,6 +38,16 @@ class TypeWord:
     source: str  # The source of the definitions, should be one of ('dic_api', 'wiki', 'other').
     definitions: List[str]  # definitions of the type word
 
+class TypeWordv2:
+    """
+    Class TypeWordv2 used to store the information (id and definition) of each type word in the UFER dataset.
+    The definition of a type word is the most frequent definition of the word.
+    """
+    id: int  # id of the type word
+    word: str  # the type word
+    source: str  # The source of the definitions, should be one of ('dic_api', 'wiki', 'other').
+    definition: str  # definitions of the type word
+
 def get_from_dictionary(word: str, **kwargs) -> Optional[List[str]]:
     """
     Do a 'get' request to the free dictionary api to get information of the given query word.
@@ -158,7 +168,16 @@ def del_none(in_file, out_file):
                 writer.write(obj)
                 count += 1
 
-def judge_by_llm(work_dir, jud_model_name, clusters, input_type_info, defi_word_id_pair, **kwargs):
+def get_best_definition(in_file, out_file):
+    """
+    read the `in_file` and get the best definition of each type word, output to the `out_file`.
+    :param in_file:
+    :param out_file:
+    :return:
+    """
+    # todo,在这里实现获取每个type word的最佳定义。大模型判断。
+
+def judge_by_llm(work_dir, jud_model_name, clusters, input_type_info, defi_word_id_pair, device_ids, **kwargs):
     """
     Judge the similarity of the definitions in each cluster by LLMs and remove the redundant definitions from each cluster.
 
@@ -169,6 +188,7 @@ def judge_by_llm(work_dir, jud_model_name, clusters, input_type_info, defi_word_
     :param input_type_info: The information of the type words. It's a dict, where the key is the id of the type word and
     :param defi_word_id_pair: Some type word have more than one definition.  We use defi_word_id_pair to track type word
         and its definition. e.g. {0:0, 1:0} means that the word (its id is 0) has two definition (defi_id 0 and defi_id 1)
+    :param device_ids: The ids of GPUs you want use to inference
     :param kwargs:
         1) checkpoint: the LLM checkpoint used to judge. model_name or path.
         2) jud_sys_prompt: (Optional) prompt for the judge model. It is used as the 'system' role of the chat message.
@@ -180,11 +200,10 @@ def judge_by_llm(work_dir, jud_model_name, clusters, input_type_info, defi_word_
         7) jud_top_p: top_p for the judge model. he smaller the value, the more deterministic the model output is.
         8) jud_max_tokens: The maximum number of tokens to generate.
         9) jud_bs: batch size for the LLM.
-        10) tensor_parallel_size: The number of GPUs you want to use for running multi-GPU inference.
-        11) dtype: The data type of the input tensor. https://docs.vllm.ai/en/latest/models/engine_args.html#cmdoption-dtype
-        12) jud_res_cache_file: the file to cache the judge results.
-        13) ver_res_cache_file: the file to cache the judge results after verification.
-        14) verify_convs_cache_file: the file to cache the verification conversations.
+        10) dtype: The data type of the input tensor. https://docs.vllm.ai/en/latest/models/engine_args.html#cmdoption-dtype
+        11) jud_res_cache_file: the file to cache the judge results.
+        12) ver_res_cache_file: the file to cache the judge results after verification.
+        13) verify_convs_cache_file: the file to cache the verification conversations.
     :return: List[int], The redundant definitions' ids.
     """
     print("="*20 + f"Start to judge by LLMs: {jud_model_name}" + "="*20)
@@ -198,10 +217,12 @@ def judge_by_llm(work_dir, jud_model_name, clusters, input_type_info, defi_word_
         # 1.1 Import the judge model
         # https://docs.vllm.ai/en/latest/getting_started/quickstart.html
         jud_model = LLM(model=kwargs['checkpoint'],
-                        tensor_parallel_size=kwargs['tensor_parallel_size'],
+                        tensor_parallel_size=len(device_ids),
                         dtype=kwargs['dtype'],
                         )
-
+        # get its tokenizer to apply the chat template
+        # https://github.com/vllm-project/vllm/issues/3119
+        jud_tokenizer = jud_model.llm_engine.tokenizer.tokenizer
         sampling_params = SamplingParams(temperature=kwargs['jud_temperature'], top_p=kwargs['jud_top_p'],
                                          max_tokens=kwargs['jud_max_tokens'])
 
@@ -244,9 +265,6 @@ def judge_by_llm(work_dir, jud_model_name, clusters, input_type_info, defi_word_
         pattern = r'\d+'  # pattern to match the number in the output
 
         with tqdm(total=len(chats), desc='judging') as t:
-            # get its tokenizer to apply the chat template
-            # https://github.com/vllm-project/vllm/issues/3119
-            jud_tokenizer = jud_model.llm_engine.tokenizer.tokenizer
             for batch_id, batch_chats in enumerate(batched(chats, kwargs['jud_bs'])):
                 # we should use tokenizer.apply_chat_template to add generation template to the chats explicitly
                 templated_batch_chats = jud_tokenizer.apply_chat_template(batch_chats, add_generation_prompt=True, tokenize=False)
@@ -334,7 +352,7 @@ def judge_by_llm(work_dir, jud_model_name, clusters, input_type_info, defi_word_
                 simi_definition_id_set.add(e['defi_id'])
 
         # Compare the number of definitions of source words.
-        # We leave the word with the least definitions.
+        # We consider the word with the most definitions as the common words, so we leave them.
         # And the others are considered as the redundant word
         # input_type_info like {1:{"word": "body_part", "source": "other", "definitions": ["a part of a human body."]}}
         # x is the defi_id like 1,
@@ -344,9 +362,8 @@ def judge_by_llm(work_dir, jud_model_name, clusters, input_type_info, defi_word_
         # input_type_info[defi_word_id_pair[x]]['definitions'] is ["a part of a human body."]
         tmp_redundant_id = [_id for _id in simi_definition_id_set]
         tmp_redundant_id.sort(key=lambda x: len(input_type_info[defi_word_id_pair[x]]['definitions']))  # ascending order
-        left_definition_id = tmp_redundant_id[0]  # We leave the word with the least definitions.
-        tmp_redundant_id.remove(left_definition_id)  # the others are redundant
-        redundant_id += tmp_redundant_id
+        # We leave the first half words with the most definitions, the others are redundant
+        redundant_id += tmp_redundant_id[:len(tmp_redundant_id)//2]
 
     return redundant_id
 
@@ -468,8 +485,9 @@ def disambiguate_type_word(in_file, out_file, cuda_devices, **kwargs):
     for jud_model_name in kwargs['jud_models']:
         # kwargs['work_dir'] is the work directory
         # kwargs[jud_model] is the config of the judge model
-        redt_id_from_this_model = judge_by_llm(kwargs['work_dir'],jud_model_name, clusters, input_type_info,
-                                    defi_word_id_pair, **kwargs[jud_model_name])
+        redt_id_from_this_model = judge_by_llm(kwargs['work_dir'],jud_model_name, clusters,
+                                               input_type_info,defi_word_id_pair, device_ids,
+                                               **kwargs[jud_model_name])
         redundant_id += redt_id_from_this_model
 
     # 4 filter and output the result

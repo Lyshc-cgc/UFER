@@ -1,0 +1,8 @@
+# pre-process config
+# Attention! ALL paths must be relative to the config file!
+
+in_dirs:  # input directory in stage1
+  - data/edited_release/distant_supervision
+  - data/edited_release/crowd
+  - data/edited_release/ontonotes
+out_dir: data/preprocessed

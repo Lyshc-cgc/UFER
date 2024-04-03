@@ -1,0 +1,49 @@
+
+# stage1 config
+# each stage has its own config, which can be fn_kwargs to be passed to the process function
+# Attention! ALL paths must be relative to the config file!
+
+# https://huggingface.co/docs/datasets/process#shard
+# We can split large files into small shards to avoid memory overflow and boost process speed.
+# specify number of shards to be processed in map function. Depends on your memory.
+# If you don't want to split, you can set num_shards to 1.
+# the larger dataset you have, the larger num_shards you need.
+num_shards: 8
+
+# specify number of workers corresponding to your CPU cores.
+# Because all the stage of processing requires the participation of GPU,
+# We recommend specifying num_workers as the number of your GPUs. Otherwise, there is a risk of OOM.
+num_workers: 8
+
+# https://huggingface.co/docs/datasets/process#multiprocessing
+# We can use the rank number to specify the GPU to use in the map function.
+with_rank: True
+
+# strict or loose. In strict mode, we get spans based on intersection of spaCy and Stanza results.
+# In loose mode, we get spans based on union of spaCy and Stanza results.
+mode: loose  # strict or loose
+in_dir: data/preprocessed  # input directory for stage1, which are results from preprocess stage
+sent_min_len: 15  # minimum length of sentence. Sentences with length less than min_len will be discarded
+span_portion: 0.3  # The proportion of the longest span length to sentence length. To filter out long span.
+batch_num_per_device: 20  # Specify number of batches on each device to be processed in map function. Depends on your RAM memory
+batch_size_per_device: 1024  #  Specify batch size per device. Depends on your GPU memory.
+spacy_model:
+  # https://spacy.io/api/top-level#spacy.load
+  # for spacy.load function, we need to specify 'name'
+  name: en_core_web_trf  # for English, we can use en_core_web_sm, en_core_web_md, en_core_web_lg, en_core_web_trf
+  disable: # disable some components to speed up, https://spacy.io/usage/processing-pipelines#disabling
+    - tagger
+    - parser
+    - ner
+    - attribute_ruler
+    - lemmatizer
+stanza_model:
+  # https://stanfordnlp.github.io/stanza/pipeline.html
+  lang: en  # for English
+  processors: tokenize, ner, pos, constituency  # specify processors, comma-seperated
+  # dir: /data1/gcchen/stanza_data  # default ~/stanza_resources
+
+  # tokenizer init
+  # https://stanfordnlp.github.io/stanza/tokenize.html#options
+  tokenize_pretokenized: True
+  tokenize_no_ssplit: True  # https://stanfordnlp.github.io/stanza/tokenize.html#tokenization-without-sentence-segmentation

@@ -1,0 +1,522 @@
+# stage2 config
+# each stage has its own config, which can be fn_kwargs to be passed to the process function
+# Attention! ALL paths must be relative to the config file!
+
+# https://huggingface.co/docs/datasets/process#shard
+# We can split large files into small shards to avoid memory overflow and boost process speed.
+# specify number of shards to be processed in map function. Depends on your memory.
+# If you don't want to split, you can set num_shards to 1.
+# the larger dataset you have, the larger num_shards you need.
+num_shards: 100
+
+# specify number of workers corresponding to your CPU cores.
+# for stage2, 1 CPU core is enough because the stage2 requires the participation of GPU.
+num_workers: 1
+
+# https://huggingface.co/docs/datasets/process#multiprocessing
+# here, we should use all GPU together to employ LLMs in the map function
+with_rank: False
+
+# In strict mode, the dataset contains fewer nested entities.
+# In loose mode, the dataset contains many nested entities
+mode: strict  # strict or loose. Strict mode
+in_dir: data/stage1  # input directory for stage2, which are results from stage1
+
+# annotating model configs
+anno_models: # choose annotating model from your config below.
+ #- Mistral  # bad performance, need to be improved
+ - Qwen
+ - Yi-ft  # 性能待议
+ - Yi  # good performance !
+
+candidate_type_words_nums: 40  # the number of candidate type words with definitions input to prompts
+candidate_type_words_template: >-
+  <id>: {id}, <word>: {word}, <definition>: {definition}
+
+Mistral:
+  checkpoint: ckpt/zhengr/MixTAO-7Bx2-MoE-v8.1 # https://huggingface.co/TheBloke/Mixtral-8x7B-Instruct-v0.1-GPTQ
+  # https://huggingface.co/TheBloke/Mixtral-8x7B-Instruct-v0.1-GPTQ#prompt-template-mistral
+  anno_usr_prompt_batch: >-
+    You are a professional and helpful English linguist. 
+    You are about to read a sentence with an entity mention marked with two special symbols (i.e, [e] and [/e]),
+    where '[e]' indicates the start of the entity mention and '[/e]' indicates the end of the entity mention.
+    The sentence is followed by the candidate type words and their corresponding definitions.
+    You should assign given candidate type words to the given entity mention by performing the following actions: 
+    1) First, you should read the candidate type words and their corresponding definitions. Each candidate type word is
+    given in the format of '<id>: the id of the type word, <word>: the candidate type word, <definition>: the definition of the type word'.
+    2) Second, you should determine what type the entity mention is in the literal and noun sense, based on its context and the directly given definitions.
+    It's worth noting that a type word may have multiple definitions, so you should differentiate them by their IDs. 
+    3) The entity mention may be multiple types. If the entity mention is at least one type exactly within the directly given candidate type words in the literal and noun sense, 
+    the answer output is the IDs of these type words. Otherwise, the answer output is '-1'.
+    4) Your output is a JSON string in the format of '{{"analysis": "your analysis process", "answer": "your answer"}}'. 
+    5) You should explain your analysis process using a concise manner in the "analysis" field of the output JSON string.
+    Your analysis must be based on the IDs and definitions of the directly given candidate type words and the context of the given entity mention.
+    Meanwhile, you should make sure that the IDs and definitions in your analysis should are consistent with the provided candidate type words.
+    6) You should know that the "answer" field of the output JSON string should be the IDs of the type words that the entity mention is, separated by commas. (e.g., "1,5,1243").
+    Please note that the IDs and the type words must be selected from the provided candidate type words.
+    7) Please be aware that no other content is permitted in the output, except for the JSON string mentioned above.
+    8) Please note that your judgment, analysis and answer must only consider the entity mention and candidate type words in the literal and noun sense.
+    Meanwhile, any high-level abstract sense, such as association, metaphor, etc., is not allowed.
+    9) Please do not force the entity mention to be assigned the type with the closest or relevant definition among all candidate type words.
+    
+    Here are some examples:
+    ### Start examples
+    1)
+    sentence: "While Goosen was busy measuring out his plots , [e] the Duke of Edinburgh [/e] , Prince Alfred of Edinburgh , visited the Cape Colony ."
+    candidate type words:
+      <id>: 0, <word>: person, <definition>: The physical body of a being seen as distinct from the mind, character, etc.
+      <id>: 1, <word>: person, <definition>: (grammar) A linguistic category used to distinguish between the speaker of an utterance and those to whom or about whom he or she is speaking. See grammatical person.
+      <id>: 2, <word>: object, <definition>: Objective; the goal, end or purpose of something.
+      <id>: 3, <word>: object, <definition>: (grammar) The noun phrase which is an internal complement of a verb phrase or a prepositional phrase. In a verb phrase with a transitive action verb, it is typically the receiver of the action.
+      <id>: 4, <word>: organization, <definition>: A group of people or other legal entities with an explicit purpose and written rules.
+      <id>: 5, <word>: event, <definition>: An occurrence; something that happens.
+      <id>: 6, <word>: event, <definition>: A prearranged social activity (function, etc.)", "One of several contests that combine to make up a competition.
+      <id>: 7, <word>: event, <definition>: An end result; an outcome (now chiefly in phrases).
+      <id>: 8, <word>: time, <definition>: The inevitable progression into the future with the passing of present and past events.
+    output:
+      {{
+        "analysis": "According to the context of the entity mention 'the Duke of Edinburgh' in the sentence, the entity mention 'the Duke of Edinburgh' refers to a person who is a duke in the literal and noun sense, which is exactly 'The physical body of a being seen as distinct from the mind, character, etc.' (<id>: 0, <word>: person). So the entity mention is 'person' with id 0. Therefore, based on the above, I should output the answer '0'",
+        "answer": "0"
+        }}
+    
+    2)
+    sentence: "The station is the rebuilt [e] Dundee Tay Bridge [/e] railway station , which had been built by the North British Railway ."
+    candidate type words:
+      <id>: 2780, <word>: drug, <definition>: Anything, such as a substance, emotion or action, to which one is addicted.
+      <id>: 2781, <word>: instrument, <definition>: A device used to produce music.
+      <id>: 2782, <word>: place, <definition>: (physical) An area; somewhere within an area. 
+      <id>: 2783, <word>: place, <definition>: A location or position in space.
+      <id>: 2784, <word>: product, <definition>: A commodity offered for sale.
+      <id>: 2785, <word>: rail, <definition>: The metal bar that makes the track for a railroad.
+      <id>: 2786, <word>: pathway, <definition>: A sequence of biochemical compounds, and the reactions linking them, that describe a process in metabolism or catabolism.
+      <id>: 2787, <word>: station, <definition>: A place where workers are stationed.
+      <id>: 2788, <word>: station, <definition>: A stopping place.
+      <id>: 2789, <word>: weapon, <definition>: An instrument or other means of harming or exerting control over another.
+      <id>: 2790, <word>: acceptance, <definition>: The act of accepting; a receiving of something offered, with acquiescence, approbation, or satisfaction; especially, favourable reception; approval.
+    output:
+      {{
+        "analysis": "According to the context of the entity mention 'Dundee Tay Bridge' in the sentence, the entity mention 'Dundee Tay Bridge' can refer to a bridge in the literal and noun sense, which is exactly '(physical) An area; somewhere within an area.' (<id>: 2782, <word>: place) and 'A location or position in space.' (<id>: 2783, <word>: place). In addition, according to its context, the entity mention 'Dundee Tay Bridge' can refer to a railway station in the literal and noun sense, which is exactly 'A stopping place' (<id>: 2788, <word>: station). So the entity mention is 'place' with id 2782, 'place' with id 2783 and 'station' with id 2788. Therefore, based on the above, I should output the answer '2782, 2783, 2788'",
+        "answer": "2782, 2783, 2788"
+        }}
+      
+    3)
+    sentence: "Rogers played hist first match on [e] February 19 , 2004 [/e] against Jamaica , in Nain ."
+    candidate type words:
+      <id>: 1347, <word>: architect, <definition>: A professional who designs buildings or other structures, or who prepares plans and superintends construction. 
+      <id>: 1348, <word>: biology, <definition>: The study of all life or living matter.
+      <id>: 1349, <word>: company, <definition>: A team; a group of people who work together professionally.
+      <id>: 1350, <word>: game, <definition>: A playful or competitive activity.
+      <id>: 1351, <word>: hospital, <definition>: A large medical facility, usually in a building with multiple floors, where seriously ill or injured patients are given extensive medical and/or surgical treatment.
+      <id>: 1352, <word>: accord, <definition>: Agreement or concurrence of opinion, will, or action.
+      <id>: 1353, <word>: accord, <definition>: An agreement between parties in controversy, by which satisfaction for an injury is stipulated, and which, when executed, prevents a lawsuit.
+      <id>: 1354, <word>: plaza, <definition>: A town's public square.
+      <id>: 1355, <word>: accident, <definition>: An unexpected event with negative consequences occurring without the intention of the one suffering the consequences.
+      <id>: 1356, <word>: city, <definition>: A settlement granted special status by royal charter or letters patent; traditionally, a settlement with a cathedral regardless of size.
+    output:
+      {{
+        "analysis": "According to the context of the entity mention 'February 19 , 2004' in the sentence, the entity mention 'February 19 , 2004' refers to a date in the literal and noun sense, which isn't any provided candidate type according to their definitions. Therefore, I should output the answer '-1'",
+        "answer": "-1"
+        }}
+    ### End examples
+  
+    ### Questions 
+    sentence: "{sentence}"
+    candidate type words:
+       {candidate_type_words}
+    output:
+
+  anno_temperature: 0.1  # temperature for this model. We expect the judge model output deterministic results, so we set temperature to 0.1.
+  anno_top_p: 0.5  # top_p for this model. The smaller the value, the more deterministic the model output is.
+  anno_max_tokens: 300  # maximum number of tokens to generate per output sequence.
+  repetition_penalty: 1.2
+  anno_bs: 12  # batch size for this model
+  dtype: float16  # https://docs.vllm.ai/en/latest/models/engine_args.html#cmdoption-dtype
+  anno_res_cache_file: jud_results.csv  # cache judgment results file
+
+#  ==========================================
+Qwen:
+  # https://huggingface.co/Qwen/Qwen1.5-14B-Chat
+  checkpoint: ckpt/Qwen/Qwen1.5-14B-Chat  # your path to the model checkpoint
+  # qwen has system prompt. We can input the examples in a form of chatting
+  # https://huggingface.co/Qwen/Qwen1.5-14B-Chat#quickstart
+  anno_sys_prompt_batch: >-
+    You are a professional and helpful English linguist. 
+    You are about to read a sentence with an entity mention marked with two special symbols (i.e, [e] and [/e]),
+    where '[e]' indicates the start of the entity mention and '[/e]' indicates the end of the entity mention.
+    The sentence is followed by the candidate type words and their corresponding definitions.
+    You should assign given candidate type words to the given entity mention by performing the following actions: 
+    1) First, you should read the candidate type words and their corresponding definitions. Each candidate type word is
+    given in the format of '<id>: the id of the type word, <word>: the candidate type word, <definition>: the definition of the type word'.
+    2) Second, you should determine what type the entity mention is in the literal and noun sense, based on its context and the directly given definitions.
+    It's worth noting that a type word may have multiple definitions, so you should differentiate them by their IDs. 
+    3) The entity mention may be multiple types. If the entity mention is at least one type exactly within the directly given candidate type words in the literal and noun sense, 
+    the answer output is the IDs of these type words. Otherwise, the answer output is '-1'.
+    4) Your output is a JSON string in the format of '{{"analysis": "your analysis process", "answer": "your answer"}}'. 
+    5) You should explain your analysis process using a concise manner in the "analysis" field of the output JSON string.
+    Your analysis must be based on the IDs and definitions of the directly given candidate type words and the context of the given entity mention.
+    Meanwhile, you should make sure that the IDs and definitions in your analysis should are consistent with the provided candidate type words.
+    6) You should know that the "answer" field of the output JSON string should be the IDs of the type words that the entity mention is, separated by commas. (e.g., "1,5,1243").
+    Please note that the IDs and the type words must be selected from the provided candidate type words.
+    7) Please be aware that no other content is permitted in the output, except for the JSON string mentioned above.
+    8) Please note that your judgment, analysis and answer must only consider the entity mention and candidate type words in the literal and noun sense.
+    Meanwhile, any high-level abstract sense, such as association, metaphor, etc., is not allowed.
+    9) Please do not force the entity mention to be assigned the type with the closest or relevant definition among all candidate type words.
+
+  # the examples can be input in a form of chatting
+  anno_examples_batch: # examples input in a form of chatting
+    - sentence: While Goosen was busy measuring out his plots , [e] the Duke of Edinburgh [/e] , Prince Alfred of Edinburgh , visited the Cape Colony .
+      candidate_type_words: >-
+        <id>: 0, <word>: person, <definition>: The physical body of a being seen as distinct from the mind, character, etc.
+        <id>: 1, <word>: person, <definition>: (grammar) A linguistic category used to distinguish between the speaker of an utterance and those to whom or about whom he or she is speaking. See grammatical person.
+        <id>: 2, <word>: object, <definition>: Objective; the goal, end or purpose of something.
+        <id>: 3, <word>: object, <definition>: (grammar) The noun phrase which is an internal complement of a verb phrase or a prepositional phrase. In a verb phrase with a transitive action verb, it is typically the receiver of the action.
+        <id>: 4, <word>: organization, <definition>: A group of people or other legal entities with an explicit purpose and written rules.
+        <id>: 5, <word>: event, <definition>: An occurrence; something that happens.
+        <id>: 6, <word>: event, <definition>: A prearranged social activity (function, etc.)", "One of several contests that combine to make up a competition.
+        <id>: 7, <word>: event, <definition>: An end result; an outcome (now chiefly in phrases).
+        <id>: 8, <word>: time, <definition>: The inevitable progression into the future with the passing of present and past events.
+      output: >-
+        {{
+          "analysis": "According to the context of the entity mention 'the Duke of Edinburgh' in the sentence, the entity mention 'the Duke of Edinburgh' refers to a person who is a duke in the literal and noun sense, which is exactly 'The physical body of a being seen as distinct from the mind, character, etc.' (<id>: 0, <word>: person). So the entity mention is 'person' with id 0. Therefore, based on the above, I should output the answer '0'",
+          "answer": "0"
+          }}
+    - sentence: The station is the rebuilt [e] Dundee Tay Bridge [/e] railway station , which had been built by the North British Railway .
+      candidate_type_words: >-
+        <id>: 2780, <word>: drug, <definition>: Anything, such as a substance, emotion or action, to which one is addicted.
+        <id>: 2781, <word>: instrument, <definition>: A device used to produce music.
+        <id>: 2782, <word>: place, <definition>: (physical) An area; somewhere within an area. 
+        <id>: 2783, <word>: place, <definition>: A location or position in space.
+        <id>: 2784, <word>: product, <definition>: A commodity offered for sale.
+        <id>: 2785, <word>: rail, <definition>: The metal bar that makes the track for a railroad.
+        <id>: 2786, <word>: pathway, <definition>: A sequence of biochemical compounds, and the reactions linking them, that describe a process in metabolism or catabolism.
+        <id>: 2787, <word>: station, <definition>: A place where workers are stationed.
+        <id>: 2788, <word>: station, <definition>: A stopping place.
+        <id>: 2789, <word>: weapon, <definition>: An instrument or other means of harming or exerting control over another.
+        <id>: 2790, <word>: acceptance, <definition>: The act of accepting; a receiving of something offered, with acquiescence, approbation, or satisfaction; especially, favourable reception; approval.
+      output: >-
+        {{
+          "analysis": "According to the context of the entity mention 'Dundee Tay Bridge' in the sentence, the entity mention 'Dundee Tay Bridge' can refer to a bridge in the literal and noun sense, which is exactly '(physical) An area; somewhere within an area.' (<id>: 2782, <word>: place) and 'A location or position in space.' (<id>: 2783, <word>: place). In addition, according to its context, the entity mention 'Dundee Tay Bridge' can refer to a railway station in the literal and noun sense, which is exactly 'A stopping place' (<id>: 2788, <word>: station). So the entity mention is 'place' with id 2782, 'place' with id 2783 and 'station' with id 2788. Therefore, based on the above, I should output the answer '2782, 2783, 2788'",
+          "answer": "2782, 2783, 2788"
+          }}
+    - sentence: Rogers played hist first match on [e] February 19 , 2004 [/e] against Jamaica , in Nain .
+      candidate_type_words: >-
+        <id>: 1347, <word>: architect, <definition>: A professional who designs buildings or other structures, or who prepares plans and superintends construction. 
+        <id>: 1348, <word>: biology, <definition>: The study of all life or living matter.
+        <id>: 1349, <word>: company, <definition>: A team; a group of people who work together professionally.
+        <id>: 1350, <word>: game, <definition>: A playful or competitive activity.
+        <id>: 1351, <word>: hospital, <definition>: A large medical facility, usually in a building with multiple floors, where seriously ill or injured patients are given extensive medical and/or surgical treatment.
+        <id>: 1352, <word>: accord, <definition>: Agreement or concurrence of opinion, will, or action.
+        <id>: 1353, <word>: accord, <definition>: An agreement between parties in controversy, by which satisfaction for an injury is stipulated, and which, when executed, prevents a lawsuit.
+        <id>: 1354, <word>: plaza, <definition>: A town's public square.
+        <id>: 1355, <word>: accident, <definition>: An unexpected event with negative consequences occurring without the intention of the one suffering the consequences.
+        <id>: 1356, <word>: city, <definition>: A settlement granted special status by royal charter or letters patent; traditionally, a settlement with a cathedral regardless of size.
+      output: >-
+        {{
+          "analysis": "According to the context of the entity mention 'February 19 , 2004' in the sentence, the entity mention 'February 19 , 2004' refers to a date in the literal and noun sense, which isn't any provided candidate type according to their definitions. Therefore, I should output the answer '-1'",
+          "answer": "-1"
+          }}
+  anno_usr_prompt_batch: >-
+    ### Questions 
+    sentence: "{sentence}"
+    candidate type words:
+       {candidate_type_words}
+    output:
+
+  anno_verify_prompt: >-
+    Your answer is not allowed. Please think again and only output 0 or 1. 
+
+  anno_temperature: 0.1  # temperature for this model. We expect the judge model output deterministic results, so we set temperature to 0.1.
+  anno_top_p: 0.5  # top_p for this model. The smaller the value, the more deterministic the model output is.
+  anno_max_tokens: 300  # maximum number of tokens to generate per output sequence.
+  repetition_penalty: 1.2
+  anno_bs: 32  # batch size for this model
+  dtype: float16  # https://docs.vllm.ai/en/latest/models/engine_args.html#cmdoption-dtype
+  anno_res_cache_file: jud_results.csv  # cache judgment results file
+
+# ==========================================
+#  Yi-ft:
+#    # https://huggingface.co/jondurbin/nontoxic-bagel-34b-v0.2
+#    # nontoxic-bagel-34b-v0.2 is an experimental fine-tune of yi-34b-200k using bagel, it can used as a chat model
+#    # we use the GPTQ quantization version of the model https://huggingface.co/TheBloke/nontoxic-bagel-34b-v0.2-GPTQ
+#    checkpoint: ckpt/TheBloke/nontoxic-bagel-34b-v0.2-GPTQ
+#    anno_sys_prompt_batch: >-
+#      You are a professional and helpful English linguist.
+#      You are about to read a sentence with an entity mention marked with two special symbols (i.e, [e] and [/e]),
+#      where '[e]' indicates the start of the entity mention and '[/e]' indicates the end of the entity mention.
+#      The sentence is followed by the candidate type words and their corresponding definitions.
+#      You should assign given candidate type words to the given entity mention by performing the following actions:
+#      1) First, you should read the candidate type words and their corresponding definitions. Each candidate type word is
+#      given in the format of '<id>: the id of the type word, <word>: the candidate type word, <definition>: the definition of the type word'.
+#      2) Second, you should determine which candidate type words the entity mention belongs to based on its context and the directly given definitions.
+#      It's worth noting that a type word may have multiple definitions, so you should differentiate them by their IDs.
+#      3) The entity mention may belong to multiple types. If the entity mention belongs to at least one type word within the directly given candidate type words,
+#      the answer output is the IDs of these type words. Otherwise, the answer output is '-1'.
+#      4) Your output format is a JSON string, like {{"analysis": "your analysis process", "answer": "your answer"}}.
+#      5) You should explain your analysis process using a concise manner in the "analysis" field of the output JSON string.
+#      Your analysis must be based on the definitions of the directly given candidate type words and the context of the given entity mention.
+#      6) You should know that the "answer" field of the output JSON string should be the IDs of the type words that the entity mention belongs to, separated by commas. (e.g., "1,5,1243").
+#      Please note that the IDs and the type words must be selected from the provided candidate type words.
+#      7) Please be aware that no other content is permitted in the output, except for the JSON string mentioned above.
+#
+#    # the examples can be input in a form of chatting
+#    anno_examples_batch: # examples input in a form of chatting
+#      - sentence: While Goosen was busy measuring out his plots , [e] the Duke of Edinburgh [/e] , Prince Alfred of Edinburgh , visited the Cape Colony .
+#        candidate_type_words: >-
+#          <id>: 0, <word>: person, <definition>: The physical body of a being seen as distinct from the mind, character, etc.
+#          <id>: 1, <word>: person, <definition>: (grammar) A linguistic category used to distinguish between the speaker of an utterance and those to whom or about whom he or she is speaking. See grammatical person.
+#          <id>: 2, <word>: object, <definition>: Objective; the goal, end or purpose of something.
+#          <id>: 3, <word>: object, <definition>: (grammar) The noun phrase which is an internal complement of a verb phrase or a prepositional phrase. In a verb phrase with a transitive action verb, it is typically the receiver of the action.
+#          <id>: 4, <word>: organization, <definition>: A group of people or other legal entities with an explicit purpose and written rules.
+#          <id>: 5, <word>: event, <definition>: An occurrence; something that happens.
+#          <id>: 6, <word>: event, <definition>: A prearranged social activity (function, etc.)", "One of several contests that combine to make up a competition.
+#          <id>: 7, <word>: event, <definition>: An end result; an outcome (now chiefly in phrases).
+#          <id>: 8, <word>: time, <definition>: The inevitable progression into the future with the passing of present and past events.
+#        output: >-
+#          {{
+#            "analysis": "According to the context of the entity mention 'the Duke of Edinburgh' in the sentence, the entity mention 'the Duke of Edinburgh' refers to a person who is a duke, which belongs to the type 'person' with id 0 (provided definition is 'The physical body of a being seen as distinct from the mind, character, etc.'). So the entity mention belongs to the type 'person' with id 0. Therefore, based on the above, I should output the answer '0'",
+#            "answer": "0"
+#            }}
+#      - sentence: The station is the rebuilt [e] Dundee Tay Bridge [/e] railway station , which had been built by the North British Railway .
+#        candidate_type_words: >-
+#          <id>: 2780, <word>: drug, <definition>: Anything, such as a substance, emotion or action, to which one is addicted.
+#          <id>: 2781, <word>: instrument, <definition>: A device used to produce music.
+#          <id>: 2782, <word>: place, <definition>: (physical) An area; somewhere within an area.
+#          <id>: 2783, <word>: place, <definition>: A location or position in space.
+#          <id>: 2784, <word>: product, <definition>: A commodity offered for sale.
+#          <id>: 2785, <word>: rail, <definition>: The metal bar that makes the track for a railroad.
+#          <id>: 2786, <word>: pathway, <definition>: A sequence of biochemical compounds, and the reactions linking them, that describe a process in metabolism or catabolism.
+#          <id>: 2787, <word>: station, <definition>: A place where workers are stationed.
+#          <id>: 2788, <word>: station, <definition>: A stopping place.
+#          <id>: 2789, <word>: weapon, <definition>: An instrument or other means of harming or exerting control over another.
+#          <id>: 2790, <word>: acceptance, <definition>: The act of accepting; a receiving of something offered, with acquiescence, approbation, or satisfaction; especially, favourable reception; approval.
+#        output: >-
+#          {{
+#            "analysis": "According to the context of the entity mention 'Dundee Tay Bridge' in the sentence, the entity mention 'Dundee Tay Bridge' can refer to a bridge, which belongs to the type 'place' with id 2782 (provided definition is '(physical) An area; somewhere within an area.') and the type 'place' with id 2783 (provided definition is 'A location or position in space.'). In addition, according to its context, the entity mention 'Dundee Tay Bridge' can refer to a bridge the name of a railway station, which belongs to the type 'station' with id 2788 (provided definition is 'A stopping place'). Therefore, based on the above, I should output the answer '2782, 2783, 2788'",
+#            "answer": "2782, 2783, 2788"
+#            }}
+#      - sentence: Rogers played hist first match on [e] February 19 , 2004 [/e] against Jamaica , in Nain .
+#        candidate_type_words: >-
+#          <id>: 1347, <word>: architect, <definition>: A professional who designs buildings or other structures, or who prepares plans and superintends construction.
+#          <id>: 1348, <word>: biology, <definition>: The study of all life or living matter.
+#          <id>: 1349, <word>: company, <definition>: A team; a group of people who work together professionally.
+#          <id>: 1350, <word>: game, <definition>: A playful or competitive activity.
+#          <id>: 1351, <word>: hospital, <definition>: A large medical facility, usually in a building with multiple floors, where seriously ill or injured patients are given extensive medical and/or surgical treatment.
+#          <id>: 1352, <word>: accord, <definition>: Agreement or concurrence of opinion, will, or action.
+#          <id>: 1353, <word>: accord, <definition>: An agreement between parties in controversy, by which satisfaction for an injury is stipulated, and which, when executed, prevents a lawsuit.
+#          <id>: 1354, <word>: plaza, <definition>: A town's public square.
+#          <id>: 1355, <word>: accident, <definition>: An unexpected event with negative consequences occurring without the intention of the one suffering the consequences.
+#          <id>: 1356, <word>: city, <definition>: A settlement granted special status by royal charter or letters patent; traditionally, a settlement with a cathedral regardless of size.
+#        output: >-
+#          {{
+#            "analysis": "According to the context of the entity mention 'February 19 , 2004' in the sentence, the entity mention 'February 19 , 2004' refers to the day when Rogers's first match is held, which does not belong to any provided candidate type words according to their definitions. Therefore, I should output the answer '-1'",
+#            "answer": "-1"
+#            }}
+#    anno_usr_prompt_batch: >-
+#      sentence: "{sentence}"
+#      candidate type words:
+#         {candidate_type_words}
+#      output:
+#    anno_temperature: 0.1  # temperature for this model. We expect the judge model output deterministic results, so we set temperature to 0.1.
+#    anno_top_p: 0.5  # top_p for this model. The smaller the value, the more deterministic the model output is.
+#    anno_max_tokens: 300  # maximum number of tokens to generate per output sequence.
+#    repetition_penalty: 1.2
+#    anno_bs: 6  # batch size for this model
+#    dtype: float16  # https://docs.vllm.ai/en/latest/models/engine_args.html#cmdoption-dtype
+#    anno_res_cache_file: jud_results.csv  # cache judgment results file
+Yi-ft:
+  # https://huggingface.co/jondurbin/nontoxic-bagel-34b-v0.2
+  # nontoxic-bagel-34b-v0.2 is an experimental fine-tune of yi-34b-200k using bagel, it can used as a chat model
+  # we use the GPTQ quantization version of the model https://huggingface.co/TheBloke/nontoxic-bagel-34b-v0.2-GPTQ
+  checkpoint: ckpt/TheBloke/nontoxic-bagel-34b-v0.2-GPTQ  # https://huggingface.co/01-ai/Yi-34B-Chat-8bits
+  # https://huggingface.co/01-ai/Yi-34B-Chat-8bits
+
+  anno_usr_prompt_batch: >-
+    You are a professional and helpful English linguist. 
+    You are about to read a sentence with an entity mention marked with two special symbols (i.e, [e] and [/e]),
+    where '[e]' indicates the start of the entity mention and '[/e]' indicates the end of the entity mention.
+    The sentence is followed by the candidate type words and their corresponding definitions.
+    You should assign given candidate type words to the given entity mention by performing the following actions: 
+    1) First, you should read the candidate type words and their corresponding definitions. Each candidate type word is
+    given in the format of '<id>: the id of the type word, <word>: the candidate type word, <definition>: the definition of the type word'.
+    2) Second, you should determine which candidate type words the entity mention belongs to based on its context and the directly given definitions.
+    It's worth noting that a type word may have multiple definitions, so you should differentiate them by their IDs. 
+    3) The entity mention may belong to multiple types. If the entity mention belongs to at least one type word within the directly given candidate type words,
+    the answer output is the IDs of these type words. Otherwise, the answer output is '-1'. 
+    4) Your output format is a JSON string, like {{"analysis": "your analysis process", "answer": "your answer"}}. 
+    5) You should explain your analysis process using a concise manner in the "analysis" field of the output JSON string.
+    Your analysis must be based on the definitions of the directly given candidate type words and the context of the given entity mention.
+    6) You should know that the "answer" field of the output JSON string should be the IDs of the type words that the entity mention belongs to, separated by commas. (e.g., "1,5,1243").
+    Please note that the IDs and the type words must be selected from the provided candidate type words.
+    7) Please be aware that no other content is permitted in the output, except for the JSON string mentioned above.
+
+    Here are some examples:
+    ### Start examples
+    1)
+    sentence: "While Goosen was busy measuring out his plots , [e] the Duke of Edinburgh [/e] , Prince Alfred of Edinburgh , visited the Cape Colony ."
+    candidate type words:
+      <id>: 0, <word>: person, <definition>: The physical body of a being seen as distinct from the mind, character, etc.
+      <id>: 1, <word>: person, <definition>: (grammar) A linguistic category used to distinguish between the speaker of an utterance and those to whom or about whom he or she is speaking. See grammatical person.
+      <id>: 2, <word>: object, <definition>: Objective; the goal, end or purpose of something.
+      <id>: 3, <word>: object, <definition>: (grammar) The noun phrase which is an internal complement of a verb phrase or a prepositional phrase. In a verb phrase with a transitive action verb, it is typically the receiver of the action.
+      <id>: 4, <word>: organization, <definition>: A group of people or other legal entities with an explicit purpose and written rules.
+      <id>: 5, <word>: event, <definition>: An occurrence; something that happens.
+      <id>: 6, <word>: event, <definition>: A prearranged social activity (function, etc.)", "One of several contests that combine to make up a competition.
+      <id>: 7, <word>: event, <definition>: An end result; an outcome (now chiefly in phrases).
+      <id>: 8, <word>: time, <definition>: The inevitable progression into the future with the passing of present and past events.
+    output:
+      {{
+        "analysis": "According to the context of the entity mention 'the Duke of Edinburgh' in the sentence, the entity mention 'the Duke of Edinburgh' refers to a person who is a duke, which belongs to the type 'person' with id 0 (provided definition is 'The physical body of a being seen as distinct from the mind, character, etc.'). So the entity mention belongs to the type 'person' with id 0. Therefore, based on the above, I should output the answer '0'",
+        "answer": "0"
+        }}
+
+    2)
+    sentence: "The station is the rebuilt [e] Dundee Tay Bridge [/e] railway station , which had been built by the North British Railway ."
+    candidate type words:
+      <id>: 2780, <word>: drug, <definition>: Anything, such as a substance, emotion or action, to which one is addicted.
+      <id>: 2781, <word>: instrument, <definition>: A device used to produce music.
+      <id>: 2782, <word>: place, <definition>: (physical) An area; somewhere within an area. 
+      <id>: 2783, <word>: place, <definition>: A location or position in space.
+      <id>: 2784, <word>: product, <definition>: A commodity offered for sale.
+      <id>: 2785, <word>: rail, <definition>: The metal bar that makes the track for a railroad.
+      <id>: 2786, <word>: pathway, <definition>: A sequence of biochemical compounds, and the reactions linking them, that describe a process in metabolism or catabolism.
+      <id>: 2787, <word>: station, <definition>: A place where workers are stationed.
+      <id>: 2788, <word>: station, <definition>: A stopping place.
+      <id>: 2789, <word>: weapon, <definition>: An instrument or other means of harming or exerting control over another.
+      <id>: 2790, <word>: acceptance, <definition>: The act of accepting; a receiving of something offered, with acquiescence, approbation, or satisfaction; especially, favourable reception; approval.
+    output:
+      {{
+        "analysis": "According to the context of the entity mention 'Dundee Tay Bridge' in the sentence, the entity mention 'Dundee Tay Bridge' can refer to a bridge, which belongs to the type 'place' with id 2782 (provided definition is '(physical) An area; somewhere within an area.') and the type 'place' with id 2783 (provided definition is 'A location or position in space.'). In addition, according to its context, the entity mention 'Dundee Tay Bridge' can refer to a bridge the name of a railway station, which belongs to the type 'station' with id 2788 (provided definition is 'A stopping place'). Therefore, based on the above, I should output the answer '2782, 2783, 2788'",
+        "answer": "2782, 2783, 2788"
+        }}
+
+    3)
+    sentence: "Rogers played hist first match on [e] February 19 , 2004 [/e] against Jamaica , in Nain ."
+    candidate type words:
+      <id>: 1347, <word>: architect, <definition>: A professional who designs buildings or other structures, or who prepares plans and superintends construction. 
+      <id>: 1348, <word>: biology, <definition>: The study of all life or living matter.
+      <id>: 1349, <word>: company, <definition>: A team; a group of people who work together professionally.
+      <id>: 1350, <word>: game, <definition>: A playful or competitive activity.
+      <id>: 1351, <word>: hospital, <definition>: A large medical facility, usually in a building with multiple floors, where seriously ill or injured patients are given extensive medical and/or surgical treatment.
+      <id>: 1352, <word>: accord, <definition>: Agreement or concurrence of opinion, will, or action.
+      <id>: 1353, <word>: accord, <definition>: An agreement between parties in controversy, by which satisfaction for an injury is stipulated, and which, when executed, prevents a lawsuit.
+      <id>: 1354, <word>: plaza, <definition>: A town's public square.
+      <id>: 1355, <word>: accident, <definition>: An unexpected event with negative consequences occurring without the intention of the one suffering the consequences.
+      <id>: 1356, <word>: city, <definition>: A settlement granted special status by royal charter or letters patent; traditionally, a settlement with a cathedral regardless of size.
+    output:
+      {{
+        "analysis": "According to the context of the entity mention 'February 19 , 2004' in the sentence, the entity mention 'February 19 , 2004' refers to the day when Rogers's first match is held, which does not belong to any provided candidate type words according to their definitions. Therefore, I should output the answer '-1'",
+        "answer": "-1"
+        }}
+    ### End examples
+
+    ### Questions 
+    sentence: "{sentence}"
+    candidate type words:
+       {candidate_type_words}
+    output:
+  anno_temperature: 0.5  # temperature for this model.
+  anno_top_p: 0.8  # top_p for this model. The smaller the value, the more deterministic the model output is.
+  anno_max_tokens: 200  # maximum number of tokens to generate per output sequence.
+  repetition_penalty: 1.2
+  anno_bs: 12  # batch size for this model
+  dtype: float16  # https://docs.vllm.ai/en/latest/models/engine_args.html#cmdoption-dtype
+  anno_res_cache_file: jud_results.csv  # cache judgment results file
+# ==========================================
+Yi:
+  checkpoint: ckpt/01-ai/Yi-34B-Chat-8bits  # https://huggingface.co/01-ai/Yi-34B-Chat-8bits
+  # https://huggingface.co/01-ai/Yi-34B-Chat-8bits
+
+  anno_usr_prompt_batch: >-
+    You are a professional and helpful English linguist.
+    You are about to read a sentence with an entity mention marked with two special symbols (i.e, [e] and [/e]),
+    where '[e]' indicates the start of the entity mention and '[/e]' indicates the end of the entity mention.
+    The sentence is followed by the candidate type words and their corresponding definition.
+    You should assign given candidate type words to the given entity mention by performing the following actions:
+    1) First, you should read the candidate type words and their corresponding definitions. Each candidate type word is
+    given in the format of '<id>: the id of the type word, <word>: the candidate type word, <definition>: the definition of the type word'.
+    2) Second, you should determine which candidate type words the entity mention belongs to based on its context and the directly given definitions.
+    It's worth noting that a type word may have multiple definitions, so you should differentiate them by their IDs.
+    3) The entity mention may belong to multiple types. If the entity mention belongs to at least one type word within the directly given candidate type words,
+    the answer output is the IDs of these type words. Otherwise, the answer output is '-1'.
+    4) Your output format is a JSON string, like {{"analysis": "your analysis process", "answer": "your answer"}}.
+    5) You should explain your analysis process using a concise manner in the "analysis" field of the output JSON string.
+    Your analysis must be based on the definitions of the directly given candidate type words and the context of the given entity mention.
+    6) You should know that the "answer" filed of the output JSON string should be the IDs of the type words that the entity mention belongs to, separated by commas. (e.g., "1,5,1243").
+    Please note that the IDs and the type words must be chosen from the directly given candidate type words.
+    7) Please note that output of other content is not allowed except for the JSON string mentioned above.
+
+    Here are some examples:
+    ### Start examples
+    1)
+    sentence: "While Goosen was busy measuring out his plots , [e] the Duke of Edinburgh [/e] , Prince Alfred of Edinburgh , visited the Cape Colony ."
+    candidate type words:
+      <id>: 0, <word>: person, <definition>: The physical body of a being seen as distinct from the mind, character, etc.
+      <id>: 1, <word>: person, <definition>: (grammar) A linguistic category used to distinguish between the speaker of an utterance and those to whom or about whom he or she is speaking. See grammatical person.
+      <id>: 2, <word>: object, <definition>: Objective; the goal, end or purpose of something.
+      <id>: 3, <word>: object, <definition>: (grammar) The noun phrase which is an internal complement of a verb phrase or a prepositional phrase. In a verb phrase with a transitive action verb, it is typically the receiver of the action.
+      <id>: 4, <word>: organization, <definition>: A group of people or other legal entities with an explicit purpose and written rules.
+      <id>: 5, <word>: event, <definition>: An occurrence; something that happens.
+      <id>: 6, <word>: event, <definition>: A prearranged social activity (function, etc.)", "One of several contests that combine to make up a competition.
+      <id>: 7, <word>: event, <definition>: An end result; an outcome (now chiefly in phrases).
+      <id>: 8, <word>: time, <definition>: The inevitable progression into the future with the passing of present and past events.
+    output:
+      {{
+        "analysis": "According to the context of the entity mention 'the Duke of Edinburgh' in the sentence, the entity mention 'the Duke of Edinburgh' matches the directly given definition 'The physical body of a being seen as distinct from the mind, character, etc.', which belongs to the given type word 'person' with id 0. Furthermore, the entity mention does not match the definitions of other directly given candidate type words. So I should output the answer '0'",
+        "answer": "0"
+        }}
+
+    2)
+    sentence: "The station is the rebuilt [e] Dundee Tay Bridge [/e] railway station , which had been built by the North British Railway ."
+    candidate type words:
+      <id>: 2780, <word>: drug, <definition>: Anything, such as a substance, emotion or action, to which one is addicted.
+      <id>: 2781, <word>: instrument, <definition>: A device used to produce music.
+      <id>: 2782, <word>: place, <definition>: (physical) An area; somewhere within an area.
+      <id>: 2783, <word>: place, <definition>: A location or position in space.
+      <id>: 2784, <word>: product, <definition>: A commodity offered for sale.
+      <id>: 2785, <word>: rail, <definition>: The metal bar that makes the track for a railroad.
+      <id>: 2786, <word>: pathway, <definition>: A sequence of biochemical compounds, and the reactions linking them, that describe a process in metabolism or catabolism.
+      <id>: 2787, <word>: station, <definition>: A place where workers are stationed.
+      <id>: 2788, <word>: station, <definition>: A stopping place.
+      <id>: 2789, <word>: weapon, <definition>: An instrument or other means of harming or exerting control over another.
+      <id>: 2790, <word>: acceptance, <definition>: The act of accepting; a receiving of something offered, with acquiescence, approbation, or satisfaction; especially, favourable reception; approval.
+    output:
+      {{
+        "analysis": "According to the context of the entity mention 'Dundee Tay Bridge' in the sentence, the entity mention 'Dundee Tay Bridge' matches the directly given definitions '(physical) An area; somewhere within an area.', 'A location or position in space.' and 'A stopping place', which belong to the directly given type word 'place' with id 2782, the type word 'place' with id 2783 and the type word 'station' with id 2788, respectively. Furthermore, the entity mention does not match the definitions of other directly given candidate type words. So I should output the answer '2782, 2783, 2788'",
+        "answer": "2782, 2783, 2788"
+        }}
+
+    3)
+    sentence: "Rogers played hist first match on [e] February 19 , 2004 [/e] against Jamaica , in Nain ."
+    candidate type words:
+      <id>: 1347, <word>: architect, <definition>: A professional who designs buildings or other structures, or who prepares plans and superintends construction.
+      <id>: 1348, <word>: biology, <definition>: The study of all life or living matter.
+      <id>: 1349, <word>: company, <definition>: A team; a group of people who work together professionally.
+      <id>: 1350, <word>: game, <definition>: A playful or competitive activity.
+      <id>: 1351, <word>: hospital, <definition>: A large medical facility, usually in a building with multiple floors, where seriously ill or injured patients are given extensive medical and/or surgical treatment.
+      <id>: 1352, <word>: accord, <definition>: Agreement or concurrence of opinion, will, or action.
+      <id>: 1353, <word>: accord, <definition>: An agreement between parties in controversy, by which satisfaction for an injury is stipulated, and which, when executed, prevents a lawsuit.
+      <id>: 1354, <word>: plaza, <definition>: A town's public square.
+      <id>: 1355, <word>: accident, <definition>: An unexpected event with negative consequences occurring without the intention of the one suffering the consequences.
+      <id>: 1356, <word>: city, <definition>: A settlement granted special status by royal charter or letters patent; traditionally, a settlement with a cathedral regardless of size.
+    output:
+      {{
+        "analysis": "According to the context of the entity mention 'February 19 , 2004' in the sentence, the entity mention 'February 19 , 2004' doesn't match the definition of any directly given candidate type word. So I should output the answer '-1'",
+        "answer": "-1"
+        }}
+    ### End examples
+
+    ### Questions
+    sentence: "{sentence}"
+    candidate type words:
+       {candidate_type_words}
+    output:
+  anno_temperature: 0.1  # temperature for this model. We expect the judge model output deterministic results, so we set temperature to 0.1.
+  anno_top_p: 0.5  # top_p for this model. The smaller the value, the more deterministic the model output is.
+  anno_max_tokens: 200  # maximum number of tokens to generate per output sequence.
+  repetition_penalty: 1.2
+  anno_bs: 12  # batch size for this model
+  dtype: float16  # https://docs.vllm.ai/en/latest/models/engine_args.html#cmdoption-dtype
+  anno_res_cache_file: jud_results.csv  # cache judgment results file
+
+# ==========================================
+# add more
