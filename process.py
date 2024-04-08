@@ -159,12 +159,12 @@ class Processor:
 
         Forth, get the best definition of each type word. The result will be stored in the 'cache_info_file_2' file.
 
-        Fifth, remove similar meanings using Clustering and LLMs. The result will be stored in the 'cache_info_file_3' file.
+        (deprecated) Fifth, remove similar meanings using Clustering and LLMs. The result will be stored in the 'cache_info_file_3' file.
         :param cache_stage: The stage of the cache file. We use this param to control the building process.
             1) 0: no cache file, we should build from scratch;
             2) 1: cache file with 'None' removed, skip the first step;
             3) 2: cache file after getting the best definition of each type word, skip the first two steps.
-            4) 3: cache file after meaning disambiguation, skip the first three steps
+            4) 3: ((deprecated)) cache file after meaning disambiguation, skip the first three steps
         """
         assert cache_stage in [0, 1, 2], f"cache_stage must be one of (0, 1, 2)!"
         type_cfg = get_config(self.config['type'])  # get type configuration
@@ -224,19 +224,20 @@ class Processor:
                                 **type_cfg)
             cache_stage += 1
 
-        cache_info_file_3 = os.path.join(work_dir, type_cfg['cache_info_file_3'])
         type_info_file = os.path.join(work_dir, type_cfg['type_info_file'])
-        if cache_stage == 3:
-            # 5. Forth, remove similar meanings using Clustering and LLMs.
-            print("Remove similar meanings using Clustering and LLMs.")
-            disambiguate_type_word(in_file=cache_info_file_2,
-                                   out_file=cache_info_file_3,
-                                   cuda_devices= self.cuda_devices,
-                                   **type_cfg)  # type_cfg is the type configuration
-            print("Building type information of the UFER dataset Done!")
-
-        shutil.copyfile(cache_info_file_3, type_info_file)
-        return cache_info_file_3
+        shutil.copyfile(cache_info_file_2, type_info_file)
+        # Step 5 is not necessary, depraecated
+        # cache_info_file_3 = os.path.join(work_dir, type_cfg['cache_info_file_3'])
+        # if cache_stage == 3:
+        #     # 5. Forth, remove similar meanings using Clustering and LLMs.
+        #     print("Remove similar meanings using Clustering and LLMs.")
+        #     disambiguate_type_word(in_file=cache_info_file_2,
+        #                            out_file=cache_info_file_3,
+        #                            cuda_devices= self.cuda_devices,
+        #                            **type_cfg)  # type_cfg is the type configuration
+        #     print("Building type information of the UFER dataset Done!")
+        # shutil.copyfile(cache_info_file_3, type_info_file)
+        return cache_info_file_2
 
     def get_type_info(self, type_info_file=None):
         """
