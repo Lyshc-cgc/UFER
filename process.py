@@ -16,7 +16,7 @@ from vllm import LLM, SamplingParams
 from nltk.tree import Tree
 from datasets import load_dataset, concatenate_datasets
 from tqdm import tqdm
-from util.type_util import get_type_word, del_none, disambiguate_type_word, TypeWord
+from util.type_util import TypeWordv2, get_type_word, del_none, get_best_definition, disambiguate_type_word
 from util.func_util import get_config, batched, eval_anno_quality
 
 class Processor:
@@ -31,11 +31,10 @@ class Processor:
         self.cuda_devices = self.config['cuda_devices']
         self.data_dir = self.config['data_dir']
 
-
         # store type information
         self.type_num = 0  # total number of type words
         self.type_words = []  # a list to store type words, just their literal values
-        self.type_info = dict()  # a dict to store all type information. key: type word, value: TypeWord object
+        self.type_info = dict()  # a dict to store all type information. key: type word, value: TypeWordv2 object
         self.type2id = dict()  # a dict to store the mapping from type word to its id
         self.id2type = dict()  # a dict to store the mapping from id to type word
 
@@ -158,11 +157,14 @@ class Processor:
 
         Third, remove the words with the definition 'None'. The result will be stored in the 'cache_info_file_1' file.
 
-        Forth, remove similar meanings using Clustering and LLMs. The result will be stored in the 'cache_info_file_2' file.
+        Forth, get the best definition of each type word. The result will be stored in the 'cache_info_file_2' file.
+
+        Fifth, remove similar meanings using Clustering and LLMs. The result will be stored in the 'cache_info_file_3' file.
         :param cache_stage: The stage of the cache file. We use this param to control the building process.
             1) 0: no cache file, we should build from scratch;
             2) 1: cache file with 'None' removed, skip the first step;
-            3) 2: cache file after meaning disambiguation, skip the first two steps.
+            3) 2: cache file after getting the best definition of each type word, skip the first two steps.
+            4) 3: cache file after meaning disambiguation, skip the first three steps
         """
         assert cache_stage in [0, 1, 2], f"cache_stage must be one of (0, 1, 2)!"
         type_cfg = get_config(self.config['type'])  # get type configuration
@@ -206,25 +208,35 @@ class Processor:
         # ...
 
         cache_info_file_1 = os.path.join(work_dir, type_cfg['cache_info_file_1'])
-        if cache_stage == 1 and not os.path.exists(cache_info_file_1):
+        if cache_stage == 1:
             # 3. Third, remove the words with the definition 'None'.
             print("Remove the words with the definition 'None'.")
             del_none(in_file=cache_info_file_0, out_file=cache_info_file_1)
             cache_stage += 1
 
         cache_info_file_2 = os.path.join(work_dir, type_cfg['cache_info_file_2'])
+        if cache_stage == 2:
+            # 4. Forth, get the best definition of each type word.
+            print("Get the best definition of each type word.")
+            get_best_definition(in_file=cache_info_file_1,
+                                out_file=cache_info_file_2,
+                                cuda_devices=self.cuda_devices,
+                                **type_cfg)
+            cache_stage += 1
+
+        cache_info_file_3 = os.path.join(work_dir, type_cfg['cache_info_file_3'])
         type_info_file = os.path.join(work_dir, type_cfg['type_info_file'])
-        if cache_stage == 2 and not os.path.exists(cache_info_file_2):
-            # 4. Forth, remove similar meanings using Clustering and LLMs.
+        if cache_stage == 3:
+            # 5. Forth, remove similar meanings using Clustering and LLMs.
             print("Remove similar meanings using Clustering and LLMs.")
-            disambiguate_type_word(in_file=cache_info_file_1,
-                                   out_file=cache_info_file_2,
+            disambiguate_type_word(in_file=cache_info_file_2,
+                                   out_file=cache_info_file_3,
                                    cuda_devices= self.cuda_devices,
                                    **type_cfg)  # type_cfg is the type configuration
             print("Building type information of the UFER dataset Done!")
 
-        shutil.copyfile(cache_info_file_2, type_info_file)
-        return cache_info_file_2
+        shutil.copyfile(cache_info_file_3, type_info_file)
+        return cache_info_file_3
 
     def get_type_info(self, type_info_file=None):
         """
@@ -240,7 +252,7 @@ class Processor:
             type_info_file = type_cfg['type_info_file']
         with jsonlines.open(type_info_file,'r') as reader, open(type_words_file, 'w') as f:
             for line in tqdm(reader, desc='get type info...'):
-                type_word_obj = TypeWord(**line)
+                type_word_obj = TypeWordv2(**line)
                 self.type_num += 1
                 self.type_words.append(type_word_obj.word)
                 self.type_info.update({type_word_obj.word: type_word_obj})
@@ -249,7 +261,7 @@ class Processor:
                 f.write(type_word_obj.word + '\n')
         print('Get type information done!')
 
-    def _prep_cand_type_words_for_stage2(self, candidate_type_words_nums=5, candidate_type_words_template=None):
+    def _prep_cand_type_words_for_stage2(self, candidate_type_words_nums=10, candidate_type_words_template=None):
         """
         Used before stage2.
         Prepare the candidate type words input to prompts.
@@ -259,13 +271,10 @@ class Processor:
         :return:
         """
         # a Sequence to store all type information.
-        # Each element is dict in a form of {'id': id of this element, 'word': type word, 'definition': one of the definitions of the type word}
+        # Each element is dict in a form of {'id': id of this element, 'word': type word, 'definition': definition of the type word}
         candidate_type_words = []
-        candidate_id = 0
-        for type_word_obj in self.type_info.values():
-            for defi in type_word_obj.definitions:
-                candidate_type_words.append({'id': candidate_id, 'word': type_word_obj.word, 'definition': defi})
-                candidate_id += 1
+        for idx, type_word_obj in enumerate(self.type_info.values()):
+            candidate_type_words.append({'id': idx, 'word': type_word_obj.word, 'definition': type_word_obj.definition})
 
         batch_cand_type_words = []
         for batch_cad_ty_words in batched(candidate_type_words, candidate_type_words_nums):
@@ -276,13 +285,13 @@ class Processor:
         return candidate_type_words, batch_cand_type_words
 
     @staticmethod
-    def _init_chat_message_for_stage2(anno_model_name: str, **anno_model_kwargs) -> list[None|dict[str,str]]:
+    def _init_chat_message_for_stage2(anno_model_name: str, **anno_model_cfg) -> list[None|dict[str,str]]:
         """
         Used before stage2.
         Init the chat messages for the annotation models.
 
         :param anno_model_name: The name of the annotation model used in the stage2.
-        :param anno_model_kwargs: The parameters of the annotation model.
+        :param anno_model_cfg: The parameters of the annotation model.
         :return:
         """
         if anno_model_name == 'Qwen':
@@ -290,10 +299,10 @@ class Processor:
             # https://huggingface.co/Qwen/Qwen1.5-72B-Chat-GPTQ-Int8
             # https://huggingface.co/TheBloke/nontoxic-bagel-34b-v0.2-GPTQ
             chat_message = [
-                {"role": "system", "content": anno_model_kwargs['anno_sys_prompt_batch']},
+                {"role": "system", "content": anno_model_cfg['anno_sys_prompt_batch']},
             ]
-            for example in anno_model_kwargs['anno_examples_batch']:
-                usr_content = anno_model_kwargs['anno_usr_prompt_batch'].format(sentence=example['sentence'],
+            for example in anno_model_cfg['anno_examples_batch']:
+                usr_content = anno_model_cfg['anno_usr_prompt_batch'].format(sentence=example['sentence'],
                                                                                 candidate_type_words=example['candidate_type_words'])
                 chat_message.append({"role": "user", "content": usr_content})
                 chat_message.append({"role": "assistant", "content": example['output']})
@@ -571,7 +580,6 @@ class Processor:
         :return:
         """
         # init wandb
-
         wandb.init(
             project='UFER',
             config=kwargs
@@ -588,7 +596,6 @@ class Processor:
             os.environ["CUDA_VISIBLE_DEVICES"] = self.cuda_devices
         gpu_num = len(os.environ["CUDA_VISIBLE_DEVICES"].split(','))
 
-        # 1. prepare the chat message
         def _generate_chat_messages(instances, anno_model_name):
             """
             Generate chat messages for each instance. Meanwhile, init the labels for each instance.
@@ -614,12 +621,13 @@ class Processor:
 
                     for b_c_t_words in kwargs['batch_cand_type_words']:
                         chat_message = copy.deepcopy(kwargs['chat_message_templates'][anno_model_name])
-                        usr_content = anno_model_kwargs['anno_usr_prompt_batch'].format(sentence=sentence, candidate_type_words=b_c_t_words)
+                        usr_content = anno_model_cfg['anno_usr_prompt_batch'].format(sentence=sentence, candidate_type_words=b_c_t_words)
                         chat_message.append({"role": "user", "content": usr_content})
                         yield sent_id, span_id, chat_message  # yield chat message, the ID of the sentences it contains and the ID of the entity mention it contains
 
-        # 2. annotate entity type by multiple LLMs.
-        for anno_model_name in kwargs['anno_models']:
+        # 1. annotate entity type by multiple LLMs.
+        for anno_model_cfg in kwargs['anno_models']:
+            anno_model_name = anno_model_cfg['name']
             instances.update({f'{anno_model_name}_labels': []})  # store type words annotated by each annotating model
             instances.update({f'{anno_model_name}_label_ids': []})  # store type word ids  annotated by each annotating model
             # instances.update({f'{anno_model_name}_anwsers': []})  # store the answer output by each annotating model
@@ -635,11 +643,10 @@ class Processor:
 
             # 1.2 Import the annotating model
             # https://docs.vllm.ai/en/latest/getting_started/quickstart.html
-            anno_model_kwargs = kwargs[anno_model_name]  # the parameters of the annotation model
-            anno_model = LLM(model=anno_model_kwargs['checkpoint'], tensor_parallel_size=gpu_num, dtype=anno_model_kwargs['dtype'])
-            sampling_params = SamplingParams(temperature=anno_model_kwargs['anno_temperature'],
-                                             top_p=anno_model_kwargs['anno_top_p'],
-                                             max_tokens=anno_model_kwargs['anno_max_tokens'])
+            anno_model = LLM(model=anno_model_cfg['checkpoint'], tensor_parallel_size=gpu_num, dtype=anno_model_cfg['dtype'])
+            sampling_params = SamplingParams(temperature=anno_model_cfg['anno_temperature'],
+                                             top_p=anno_model_cfg['anno_top_p'],
+                                             max_tokens=anno_model_cfg['anno_max_tokens'])
 
             # get anno_model's tokenizer to apply the chat template
             # https://github.com/vllm-project/vllm/issues/3119
@@ -647,7 +654,7 @@ class Processor:
 
             # 1.3 batch process
             num_shards = kwargs['num_shards']
-            pbar = tqdm(batched(_generate_chat_messages(instances, anno_model_name), anno_model_kwargs['anno_bs']),
+            pbar = tqdm(batched(_generate_chat_messages(instances, anno_model_name), anno_model_cfg['anno_bs']),
                         desc=f'annotating shards {shard_idx}/{num_shards}')
             num_spans = 0  # store the number of spans in the dataset shard
             json_pattern = r'\{.*?\}'  # the pattern to extract JSON string
@@ -752,7 +759,8 @@ class Processor:
 
             # init output dir and the chat messages for each annotation model
             stage_cfg.update({'chat_message_templates': dict()})  # store the chat message templates for the annotation models
-            for anno_model_name in stage_cfg['anno_models']:
+            for anno_model_cfg in stage_cfg['anno_models']:
+                anno_model_name = anno_model_cfg['name']
                 out_dir_model = os.path.join(out_dir, anno_model_name)  # out_dir/mode/annt_model_name/
                 if not os.path.exists(out_dir_model):
                     os.makedirs(out_dir_model)

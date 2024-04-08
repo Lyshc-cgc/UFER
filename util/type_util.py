@@ -9,6 +9,7 @@ This module is used to help build the type information of the UFER dataset, incl
 2) remove unsuitable type words by disambiguating.
 """
 import ast
+import copy
 import re
 import os
 import requests
@@ -18,7 +19,7 @@ import wikipedia as wp
 import pandas as pd
 import torch
 import itertools
-from util.func_util import batched
+import numpy as np
 from collections import Counter
 from vllm import LLM, SamplingParams
 from sklearn.cluster import BisectingKMeans
@@ -26,7 +27,7 @@ from transformers import AutoModel, AutoTokenizer
 from dataclasses import dataclass
 from typing import List, Optional
 from tqdm import tqdm
-
+from util.func_util import get_device_ids, batched
 
 @dataclass
 class TypeWord:
@@ -38,6 +39,7 @@ class TypeWord:
     source: str  # The source of the definitions, should be one of ('dic_api', 'wiki', 'other').
     definitions: List[str]  # definitions of the type word
 
+@dataclass
 class TypeWordv2:
     """
     Class TypeWordv2 used to store the information (id and definition) of each type word in the UFER dataset.
@@ -156,6 +158,9 @@ def del_none(in_file, out_file):
     :param out_file: file output
     :return:
     """
+    if os.path.exists(out_file):
+        print(f"{out_file} exists, we don't need to delete the type words with the definition 'None' again.")
+        return
     count = 0
     with jsonlines.open(in_file, 'r') as reader, jsonlines.open(out_file, 'w') as writer:
         for obj in tqdm(reader):
@@ -168,53 +173,163 @@ def del_none(in_file, out_file):
                 writer.write(obj)
                 count += 1
 
-def get_best_definition(in_file, out_file, **kwargs):
+def get_defi_by_llm(in_file, device_ids, **def_model_cfg):
     """
-    read the `in_file` and get the best definition of each type word, output to the `out_file`.
+    get the best definition of each type word by LLMs.
     :param in_file:
-    :param out_file:
-    :param kwargs:
-        1) checkpoint: the LLM checkpoint used to judge. model_name or path.
-        2) sys_prompt: (Optional) prompt for the judge model. It is used as the 'system' role of the chat message.
-        3) examples: (Optional) examples for the judge model to generate the chat message. It is used as the 'user' and 'assistant' role of the chat message.
-        5) jud_verify_prompt: prompt for the judge model to verify the answer.  We need to continue the conversation to
-            ask for the correct answer
-        6) temperature: temperature for the judge model. Default is 0.
-        7) top_p: top_p for the judge model. he smaller the value, the more deterministic the model output is.
-        8) max_tokens: The maximum number of tokens to generate.
-        9) bs: batch size for the LLM.
-        10) dtype: The data type of the input tensor. https://docs.vllm.ai/en/latest/models/engine_args.html#cmdoption-dtype
-        11) jud_res_cache_file: the file to cache the judge results.
-        12) ver_res_cache_file: the file to cache the judge results after verification.
-        13) verify_convs_cache_file: the file to cache the verification conversations.
+    :param device_ids: The ids of GPUs you want use to inference
+    :param def_model_cfg: the configuration of the def model used to get the best definition.
     :return:
     """
-    # todo,在这里实现获取每个type word的最佳定义。大模型判断。
-    for model_name in kwargs['def_models']:
-        pass
+    def _generate_chat_messages(in_file, chat_msg_template, **kwargs):
+        """
+        Generate chat messages for each type word in the input file.
+        :param in_file: input file containing the type words with multiple definitions
+        :param chat_msg_template: the chat message template for the model to generate the chat message.
+        :param kwargs:
+        :return:
+        """
+        with jsonlines.open(in_file) as reader:
+            for line in reader:
+                type_word = TypeWord(**line)
+                if len(type_word.definitions) == 1:  # skip the type words with only one definition
+                    continue
+                chat_msg = copy.deepcopy(chat_msg_template)
+                defis = []
+                for idx, defi in enumerate(type_word.definitions):
+                    defi = kwargs['def_template'].format(id=idx, definition=defi)
+                    defis.append(defi)
+                usr_content = kwargs['usr_prompt'].format(word=type_word.word, definitions=' '.join(defis))
+                chat_msg.append({"role": "user", "content": usr_content})
+                yield chat_msg
 
-def judge_by_llm(work_dir, clusters, input_type_info, defi_word_id_pair, device_ids, **kwargs):
+    # 1. init chat message template
+    if def_model_cfg['name'] == 'Qwen':
+        chat_msg_template = [
+            {"role": "system", "content": def_model_cfg['sys_prompt']},
+        ]
+        for example in def_model_cfg['examples']:
+            usr_content = def_model_cfg['usr_prompt'].format(word=example['word'], definitions=example['definitions'])
+            chat_msg_template.append({"role": "user", "content": usr_content})
+            chat_msg_template.append({"role": "assistant", "content": str(example['output'])})
+    else:
+        # e.g., for mistral and Yi, we only need to input the user's prompt
+        chat_msg_template = []
+
+    # 2. init llm and its tokenizer
+    def_model = LLM(model=def_model_cfg['checkpoint'], tensor_parallel_size=len(device_ids), dtype=def_model_cfg['dtype'])
+    # get its tokenizer to apply the chat template
+    # https://github.com/vllm-project/vllm/issues/3119
+    tokenizer = def_model.llm_engine.tokenizer.tokenizer
+    sampling_params = SamplingParams(temperature=def_model_cfg['temperature'], top_p=def_model_cfg['top_p'], max_tokens=def_model_cfg['max_tokens'])
+
+    # 3. main process
+    assert in_file.endswith('.jsonl'), f"Input file should be a jsonl file, but got {in_file}"
+    pbar = tqdm(batched(_generate_chat_messages(in_file, chat_msg_template, **def_model_cfg),
+                        def_model_cfg['bs']),
+                desc=f"get best definition by {def_model_cfg['name']}", )
+    pattern = r'\d+'  # pattern to match the number in the output
+    each_results = []  # store the judge result by each llm
+    for batch_chats in pbar:
+        # we should use tokenizer.apply_chat_template to add generation template to the chats explicitly
+        templated_batch_chats = tokenizer.apply_chat_template(batch_chats, add_generation_prompt=True, tokenize=False)
+        outputs = def_model.generate(templated_batch_chats, sampling_params)
+        for out_id, output in enumerate(outputs):
+            answer = output.outputs[0].text
+            if not (result := re.search(pattern, answer)):  # there is not a number in this output
+                result = 0  # we set default to 0, the first definition is the best definition
+            else:
+                # Yeah! We got the answer we needed
+                result = int(result.group())
+            each_results.append(result)
+    return each_results
+
+def get_best_definition(in_file, out_file, cuda_devices, **kwargs):
+    """
+    read the `in_file` and get the best definition of each type word, output to the `out_file`.
+    :param in_file: input file containing the type words with multiple definitions
+    :param out_file: output file containing the type words with the best definition
+    :param kwargs:
+        1) def_models: configurations of the def models used to get the best definition.
+        2) work_dir: the work directory.
+    :return:
+    """
+    if os.path.exists(out_file):
+        print(f"{out_file} exists, we don't need to get the best definition again.")
+        return # if the output file exists, we don't need to get the best definition again
+
+    # 0. Some settings
+    os.environ['TOKENIZERS_PARALLELISM'] = 'false'  # avoid parallelism in tokenizers
+    device_ids = get_device_ids(cuda_devices)
+    results = []  # store the judge results from all def models
+
+    # 1. get best definition by each LLM
+    for def_model_cfg in kwargs['def_models']:
+        # Attention, this for loop is used to get the best definition by each def model
+        # However, because some unknown reason about vLLm or Ray, we cannot empty the GPU memory after each loop
+        # So, we should manually run this for loop for each def model and cache their results.
+
+        # 1.1. check the cache file
+        model_work_dir = os.path.join(kwargs['work_dir'], def_model_cfg['name'])
+        cache_file_name = def_model_cfg['def_res_cache_file']
+        def_res_cache_file = os.path.join(model_work_dir, cache_file_name)  # the file to cache the results from all def models
+
+        if os.path.exists(def_res_cache_file):  # read the cache file directly
+            cache_res = pd.read_csv(def_res_cache_file)
+            results.append(cache_res.iloc[:, 1].tolist())
+            continue
+
+        # else we should get the best definition by this LLM from scratch
+        # 1.2 get result by this LLM
+        each_results = get_defi_by_llm(in_file, device_ids, **def_model_cfg)
+        results.append(each_results)
+
+        # 1.3 cache the result by each llm
+        if not os.path.exists(model_work_dir):
+            os.makedirs(model_work_dir)
+        pd.DataFrame(each_results, columns=['result']).to_csv(def_res_cache_file, index_label='id')
+
+    # 2. get the best definition for each type words by voting
+    results = np.array(results).T  # after transpose, each row of the results indicates represents the judgement results from different models for the definition of a type word.
+    best_def_idxs= []
+    for row in results:
+        best_def = Counter(row).most_common(1)[0]
+        best_def_idxs.append(best_def[0])  # best_def[0] is the index of the best definition, best_def[1] is the vote number
+
+    with jsonlines.open(in_file, 'r') as reader, jsonlines.open(out_file, 'w') as writer:
+        idx = 0  # index for those type words with multiple definitions
+        for line in reader:
+            if len(line['definitions']) == 1:  # For those type words with only one definition, copy directly
+                line['definition'] = line['definitions'][0]
+            else:  # For those type words with multiple definitions, we should get the best definition by voting
+                best_def_idx = best_def_idxs[idx]
+                # if best_def_idx >= len(line['definitions']):  # wrong best_def_idx
+                #     print(f"id: {line['id']}, word: {line['word']}, best_def_idx: {best_def_idx}, len(definitions): {len(line['definitions'])}")
+                #     continue
+                line['definition'] = line['definitions'][best_def_idx]
+            del line['definitions']
+            writer.write(line)
+
+def judge_by_llm(work_dir, clusters, device_ids, **kwargs):
     """
     Judge the similarity of the definitions in each cluster by LLMs and remove the redundant definitions from each cluster.
 
     :param work_dir: The work directory for this judge model.
     :param clusters: The clusters of the definitions of the type words. Each cluster is a list of dict, where each dict
         contains the id of the definition and the definition.
-    :param input_type_info: The information of the type words. It's a dict, where the key is the id of the type word and
-    :param defi_word_id_pair: Some type word have more than one definition.  We use defi_word_id_pair to track type word
-        and its definition. e.g. {0:0, 1:0} means that the word (its id is 0) has two definition (defi_id 0 and defi_id 1)
     :param device_ids: The ids of GPUs you want use to inference
     :param kwargs:
+        0) name: the name of the LLM used to judge.
         1) checkpoint: the LLM checkpoint used to judge. model_name or path.
-        2) jud_sys_prompt: (Optional) prompt for the judge model. It is used as the 'system' role of the chat message.
-        3) jud_examples: (Optional) examples for the judge model to generate the chat message. It is used as the 'user' and 'assistant' role of the chat message.
-        4) jud_usr_prompt: prompt for the judge model. It should be the 'user' role of the chat message.
-        5) jud_verify_prompt: prompt for the judge model to verify the answer.  We need to continue the conversation to
+        2) sys_prompt: (Optional) prompt for the judge model. It is used as the 'system' role of the chat message.
+        3) examples: (Optional) examples for the judge model to generate the chat message. It is used as the 'user' and 'assistant' role of the chat message.
+        4) usr_prompt: prompt for the judge model. It should be the 'user' role of the chat message.
+        5) verify_prompt: prompt for the judge model to verify the answer.  We need to continue the conversation to
             ask for the correct answer
-        6) jud_temperature: temperature for the judge model. Default is 0.
-        7) jud_top_p: top_p for the judge model. he smaller the value, the more deterministic the model output is.
-        8) jud_max_tokens: The maximum number of tokens to generate.
-        9) jud_bs: batch size for the LLM.
+        6) temperature: temperature for the judge model. Default is 0.
+        7) top_p: top_p for the judge model. he smaller the value, the more deterministic the model output is.
+        8) max_tokens: The maximum number of tokens to generate.
+        9) bs: batch size for the LLM.
         10) dtype: The data type of the input tensor. https://docs.vllm.ai/en/latest/models/engine_args.html#cmdoption-dtype
         11) jud_res_cache_file: the file to cache the judge results.
         12) ver_res_cache_file: the file to cache the judge results after verification.
@@ -239,14 +354,29 @@ def judge_by_llm(work_dir, clusters, input_type_info, defi_word_id_pair, device_
         # get its tokenizer to apply the chat template
         # https://github.com/vllm-project/vllm/issues/3119
         jud_tokenizer = jud_model.llm_engine.tokenizer.tokenizer
-        sampling_params = SamplingParams(temperature=kwargs['jud_temperature'], top_p=kwargs['jud_top_p'],
-                                         max_tokens=kwargs['jud_max_tokens'])
+        sampling_params = SamplingParams(temperature=kwargs['temperature'], top_p=kwargs['top_p'],
+                                         max_tokens=kwargs['max_tokens'])
 
         # 1.2 Remove definitions with duplicate meanings in each cluster by pairwise comparison
         # 1.2.1 prepare the chats input to the judge model
         chats = []  # store the chats
         defi_As, defi_Bs = [], []  # store the first and second def of each pair respectively
         pair_num_of_clusters = []  # store the number of pairs of each cluster
+
+        # 1.2.2 prepare the chat message in different format according to the judge model
+        if jud_model_name == 'Qwen':
+            chat_msg_template = [
+                {"role": "system", "content": kwargs['sys_prompt']},
+            ]
+            for example in kwargs['examples']:
+                usr_content = kwargs['usr_prompt'].format(first_definition=example['definition_A'],
+                                                          second_definition=example['definition_B'])
+                chat_msg_template.append({"role": "user", "content": usr_content})
+                chat_msg_template.append({"role": "assistant", "content": str(example['output'])})
+        else:
+            # e.g., for mistral and Yi, we only need to input the user's prompt
+            chat_msg_template = []
+
         for cluster in clusters:
             # get definition pair in this clustering
             # https://docs.python.org/3.10/library/itertools.html#itertools.combinations
@@ -256,23 +386,10 @@ def judge_by_llm(work_dir, clusters, input_type_info, defi_word_id_pair, device_
                 defi_As.append(defi_A)
                 defi_Bs.append(defi_B)
 
-                # prepare the chat message in different format according to the judge model
-                if jud_model_name == 'qwen':
-                    # https://huggingface.co/Qwen/Qwen1.5-7B-Chat
-                    chat_message = [
-                        {"role": "system", "content": kwargs['jud_sys_prompt']},
-                    ]
-                    for example in kwargs['jud_examples']:
-                        usr_content = kwargs['jud_usr_prompt'].format(first_definition=example['definition_A'], second_definition=example['definition_B'])
-                        chat_message.append({"role": "user", "content": usr_content})
-                        chat_message.append({"role": "assistant", "content": str(example['output'])})
-                else:
-                    # e.g., for mistral and Yi, we only need to input the user's prompt
-                    chat_message = []
-
-                usr_content = kwargs['jud_usr_prompt'].format(first_definition=defi_A['definition'], second_definition=defi_B['definition'])
-                chat_message.append({"role": "user", "content": usr_content})
-                chats.append(chat_message)
+                tmp_chat_msg = copy.deepcopy(chat_msg_template)
+                usr_content = kwargs['usr_prompt'].format(first_definition=defi_A['definition'], second_definition=defi_B['definition'])
+                tmp_chat_msg.append({"role": "user", "content": usr_content})
+                chats.append(tmp_chat_msg)
 
         # 1.2.2 prepare the batched chats input to the judge model, and then judge
         jud_results = []  # store the judge result
@@ -280,49 +397,53 @@ def judge_by_llm(work_dir, clusters, input_type_info, defi_word_id_pair, device_
         verify_conv_ids = []  # store the id of the verification conversations need to be continued
         pattern = r'\d+'  # pattern to match the number in the output
 
-        with tqdm(total=len(chats), desc='judging') as t:
-            for batch_id, batch_chats in enumerate(batched(chats, kwargs['jud_bs'])):
-                # we should use tokenizer.apply_chat_template to add generation template to the chats explicitly
-                templated_batch_chats = jud_tokenizer.apply_chat_template(batch_chats, add_generation_prompt=True, tokenize=False)
-                outputs = jud_model.generate(templated_batch_chats, sampling_params)  # judge
-                for out_id, output in enumerate(outputs):
-                    conv_id = batch_id * kwargs['jud_bs'] + out_id  # the id of the conversation
-                    out_answer = output.outputs[0].text
-                    if jud_result := re.search(pattern, out_answer):  # there is a number in the output
-                        jud_result = int(jud_result.group())
-                        if jud_result in (1, 0):  # LLM generated correct result
-                            jud_results.append(jud_result)  # here, jud_result is 1 or 0
-                            continue
-                    # There are 2 cases to execute the following code:
-                    # 1) There is no number in the output,
-                    # 2) The number is not 1 or 0, which means that the LLM generated wrong result
-                    #  We should store those verification conversations, which need to be continued to ask for the correct answer.
-                    jud_results.append(-1)  # label the result as -1, which means that the LLM didn't generated answer we needed
+        jud_res_cache_file = os.path.join(out_dir, kwargs['jud_res_cache_file'])  # the file to cache the judge results
+        verify_convs_cache_file = os.path.join(out_dir, kwargs['verify_convs_cache_file'])  # the file to cache the verification conversations
+        if not os.path.exists(jud_res_cache_file) or not os.path.exists(verify_convs_cache_file):  # doesn't exist, we should judge from scratch
+            with tqdm(total=len(chats), desc='judging') as t:
+                for batch_id, batch_chats in enumerate(batched(chats, kwargs['bs'])):
+                    # we should use tokenizer.apply_chat_template to add generation template to the chats explicitly
+                    templated_batch_chats = jud_tokenizer.apply_chat_template(batch_chats, add_generation_prompt=True, tokenize=False)
+                    outputs = jud_model.generate(templated_batch_chats, sampling_params)  # judge
+                    for out_id, output in enumerate(outputs):
+                        conv_id = batch_id * kwargs['bs'] + out_id  # the id of the conversation
+                        out_answer = output.outputs[0].text
+                        if jud_result := re.search(pattern, out_answer):  # there is a number in the output
+                            jud_result = int(jud_result.group())
+                            if jud_result in (1, 0):  # LLM generated correct result
+                                jud_results.append(jud_result)  # here, jud_result is 1 or 0
+                                continue
+                        # There are 2 cases to execute the following code:
+                        # 1) There is no number in the output,
+                        # 2) The number is not 1 or 0, which means that the LLM generated wrong result
+                        #  We should store those verification conversations, which need to be continued to ask for the correct answer.
+                        jud_results.append(-1)  # label the result as -1, which means that the LLM didn't generated answer we needed
 
-                    # verify_convs.append(output.prompt + out_answer + '</s>' + kwargs['jud_verify_prompt'])
+                        # batch_chats[out_id] is a chat message history need to be continued, like [{"role": "user", "content": <prompt>}]
+                        # we need to append the new message to it
+                        batch_chats[out_id].append({"role": "assistant", "content": out_answer})  # append the LLM's answer
+                        batch_chats[out_id].append({"role": "user", "content": kwargs['verify_prompt']})  # append the verification prompt
+                        verify_convs.append(jud_tokenizer.apply_chat_template(batch_chats[out_id], tokenize=False, add_generation_template=True))
+                        verify_conv_ids.append(conv_id)
+                    t.update(kwargs['bs'])
 
-                    # batch_chats[out_id] is a chat message history need to be continued, like [{"role": "user", "content": <prompt>}]
-                    # we need to append the new message to it
-                    batch_chats[out_id].append({"role": "assistant", "content": out_answer})  # append the LLM's answer
-                    batch_chats[out_id].append({"role": "user", "content": kwargs['jud_verify_prompt']})  # append the verification prompt
-                    verify_convs.append(jud_tokenizer.apply_chat_template(batch_chats[out_id], tokenize=False, add_generation_template=True))
-                    verify_conv_ids.append(conv_id)
-                t.update(kwargs['jud_bs'])
+            # 1.2.3 cache the judge results and the verification conversations
+            cache_jud_results = {'jud_results': jud_results, 'definition_A': defi_As, 'definition_B': defi_Bs}
+            cache_verify_convs = {'verify_conv_ids': verify_conv_ids, 'verify_convs': verify_convs}
+            pd.DataFrame(cache_jud_results).to_csv(jud_res_cache_file, index_label='id')
+            pd.DataFrame(cache_verify_convs).to_csv(verify_convs_cache_file, index_label='id')
+        else:  # read the judge result from the cache file directly
+            cache_jud_results = pd.read_csv(jud_res_cache_file)
+            jud_results = cache_jud_results['jud_results'].tolist()
 
-        # 1.2.3 cache the judge results and the verification conversations
-        cache_jud_results = {'jud_results': jud_results, 'definition_A': defi_As, 'definition_B': defi_Bs}
-        cache_verify_convs = {'verify_conv_ids': verify_conv_ids, 'verify_convs': verify_convs}
-
-        jud_res_cache_file = os.path.join(out_dir, kwargs['jud_res_cache_file'])
-        verify_convs_cache_file = os.path.join(out_dir, kwargs['verify_convs_cache_file'])
-
-        pd.DataFrame(cache_jud_results).to_csv(jud_res_cache_file, index_label='id')
-        pd.DataFrame(cache_verify_convs).to_csv(verify_convs_cache_file, index_label='id')
+            cache_verify_convs = pd.read_csv(verify_convs_cache_file)
+            verify_conv_ids = cache_verify_convs['verify_conv_ids'].tolist()
+            verify_convs = cache_verify_convs['verify_convs'].tolist()
 
         # 1.2.4 start to verify We need to continue the conversation to ask for the correct answer
         with tqdm(total=len(verify_convs), desc='verifying') as t:
-            for batch_convs, batch_conv_ids in zip(batched(verify_convs, kwargs['jud_bs']),
-                                                   batched(verify_conv_ids, kwargs['jud_bs'])):
+            for batch_convs, batch_conv_ids in zip(batched(verify_convs, kwargs['bs']),
+                                                   batched(verify_conv_ids, kwargs['bs'])):
                 # the batch_cons are applied templated in Line 275, so we don't need to apply template again
                 outputs = jud_model.generate(batch_convs, sampling_params)  # verify
                 for conv_id, output in zip(batch_conv_ids, outputs):
@@ -333,11 +454,13 @@ def judge_by_llm(work_dir, clusters, input_type_info, defi_word_id_pair, device_
                             jud_results[conv_id] = jud_result  # here, jud_result is 1 or 0
                             continue
                     raise ValueError(f"LLM didn't generate answer we needed: {jud_result}")
-                t.update(kwargs['jud_bs'])
+                t.update(kwargs['bs'])
 
         # 1.2.5 cache the results after verification
         cache_jud_results = {'jud_results': jud_results, 'definition_A': defi_As, 'definition_B': defi_Bs}
         pd.DataFrame(cache_jud_results).to_csv(ver_res_cache_file, index_label='id')
+        del jud_model
+        torch.cuda.empty_cache()
     else:  # read the judge result (after verification) from the cache file directly
         print(f"Read directly the judge result (after verification) from the cache file: {ver_res_cache_file}")
         cache_ver_jud_results = pd.read_csv(ver_res_cache_file)
@@ -366,20 +489,9 @@ def judge_by_llm(work_dir, clusters, input_type_info, defi_word_id_pair, device_
         for pair in group:
             for e in pair:
                 simi_definition_id_set.add(e['defi_id'])
-
-        # Compare the number of definitions of source words.
-        # We consider the word with the most definitions as the common words, so we leave them.
-        # And the others are considered as the redundant word
-        # input_type_info like {1:{"word": "body_part", "source": "other", "definitions": ["a part of a human body."]}}
-        # x is the defi_id like 1,
-        # defi_word_id_pair , e.g. {0:0, 1:0} means that the word (its id is 0) has two definition (defi_id 0 and defi_id 1)
-        # defi_word_id_pair[x] is the source word's id of the defi_id x
-        # input_type_info[defi_word_id_pair[x]] is {"word": "body_part", "source": "other", "definitions": ["a part of a human body."]}
-        # input_type_info[defi_word_id_pair[x]]['definitions'] is ["a part of a human body."]
-        tmp_redundant_id = [_id for _id in simi_definition_id_set]
-        tmp_redundant_id.sort(key=lambda x: len(input_type_info[defi_word_id_pair[x]]['definitions']))  # ascending order
-        # We leave the first half words with the most definitions, the others are redundant
-        redundant_id += tmp_redundant_id[:len(tmp_redundant_id)//2]
+        tmp_redundant_id = sorted(list(simi_definition_id_set))
+        # We leave first definition in each group, and consider others as the redundant definitions to be removed
+        redundant_id += tmp_redundant_id[1:]
 
     return redundant_id
 
@@ -410,36 +522,24 @@ def disambiguate_type_word(in_file, out_file, cuda_devices, **kwargs):
 
     :return:
     """
+    if os.path.exists(out_file):
+        print(f"{out_file} exists, we don't need to disambiguate type words again.")
+        return
     # 0. Some settings
     os.environ['TOKENIZERS_PARALLELISM'] = 'false'  # avoid parallelism in tokenizers
     # set GPU device
-    if cuda_devices == 'all':
-        # set the GPU can be used
-        device_ids = [i for i in range(torch.cuda.device_count())]
-        cuda_devices = [str(i) for i in range(torch.cuda.device_count())]
-        os.environ["CUDA_VISIBLE_DEVICES"] = ','.join(cuda_devices)
-    else:
-        os.environ["CUDA_VISIBLE_DEVICES"] = cuda_devices
-        device_ids = [int(i) for i in cuda_devices.split(',')]
+    device_ids = get_device_ids(cuda_devices)
     main_device = str(device_ids[0])
     device = torch.device(f"cuda:{main_device}")  # set the main GPU device
 
-    # 1. Preprocess the definitions of the input type words
-    # 2.1 get type words' definitions
-    all_definitions = []  # store all definition
-    defi_word_id_pair = dict()  # Some type word have more than one definition. We use defi_word_id_pair to track type word and its definition
-    defi_id = 0  # index all definition.
-    input_type_info = dict()  # store the input type information
+    # 1. Preprocess the definition of the input type words
+    # 2.1 get type words' definition
+    all_definitions = []  # store all definitions
+    type_info = []  # store the information of the type words
     with jsonlines.open(in_file, mode='r') as in_file:
         for line in in_file:
-            word_id, definitions = line['id'], line['definitions']
-            del line['id']
-            input_type_info.update({word_id: line})  # e.g. {1:{"word": "body_part", "source": "other", "definitions": ["a part of a human body."]}}
-            for defi in definitions:
-                if defi != 'None':
-                    all_definitions.append(defi)
-                    defi_word_id_pair.update({defi_id: word_id})  # e.g. {0:0, 1:0} means that the word (its id is 0) has two definition (defi_id 0 and defi_id 1)
-                    defi_id += 1
+            type_info.append(line)
+            all_definitions.append(line['definition'])
 
     # 2. Embedding and Clustering
     # 2.1 read cached cluster results or do embedding and clustering from scratch
@@ -502,8 +602,7 @@ def disambiguate_type_word(in_file, out_file, cuda_devices, **kwargs):
     for jud_model_cfg in kwargs['jud_models']:
         # kwargs['work_dir'] is the work directory
         # kwargs[jud_model] is the config of the judge model
-        redt_id_from_this_model = judge_by_llm(kwargs['work_dir'], clusters,input_type_info,
-                                               defi_word_id_pair, device_ids, **jud_model_cfg)
+        redt_id_from_this_model = judge_by_llm(kwargs['work_dir'], clusters,device_ids, **jud_model_cfg)
         redundant_id += redt_id_from_this_model
 
     # 4 filter and output the result
@@ -511,23 +610,20 @@ def disambiguate_type_word(in_file, out_file, cuda_devices, **kwargs):
     # e.g. [0, 0, 1, 1, 2, 3, 3] -> {0: 2, 1: 2, 2: 1, 3: 2}, key is the redundant id, value is the number of votes
     # https://docs.python.org/3.10/library/collections.html?highlight=counter#counter-objects
     counter = Counter(redundant_id)
-    voting_res = filter(lambda x: x[1] > len(kwargs['jud_models']) / 2, counter.items())
+    # voting_res = filter(lambda x: x[1] >= len(kwargs['jud_models']) / 2, counter.items())
+    voting_res = filter(lambda x: x[1] > 0, counter.items())
     redundant_id = [x[0] for x in voting_res]  # key is the redundant id
 
     # 4.2 filter the redundant definition according the redundant_id by voting from different judge models
-    # e.g. [(0, 0), (1, 0), (2, 0), (3, 1), (4, 1), (5, 2), (6, 3), (7, 3)] -> [(0, 0), (2, 0), (3, 1), (6, 3), (7, 3)]
-    result = filter(lambda item: item[0] not in redundant_id, defi_word_id_pair.items())
     with jsonlines.open(out_file, 'w') as writer:
-
-        # group by the original word_id (the second element of the tuple in the defi_word_id_pair)
-        # e.g. [(0, 0), (2, 0), (3, 1), (6, 3), (7, 3)] -> [(0, 0), (2, 0)] | [(3, 1)] | [(6, 3), (7, 3)]
-        # key is the original word_id (i.e., x[1]) like 0, group is the definition ids of the word_id like [(0, 0), (2, 0)]
-        for new_word_id, (orig_word_id, group) in enumerate(itertools.groupby(result, key=lambda x: x[1])):
-            definitions = [all_definitions[defi_id] for defi_id, _ in group]
+        new_word_id = 0
+        for line in type_info:
+            if line['id'] in redundant_id:  # skip redundant type words
+                continue
             writer.write({'id': new_word_id,
-                          'word': input_type_info[orig_word_id]['word'],
-                          'source': input_type_info[orig_word_id]['source'],
-                          'definitions': definitions})
+                          'word': line['word'],
+                          'source': line['source'],
+                          'definition': line['definition']})
 
     print(f"store the disambiguated type words in the file: {out_file}")
 

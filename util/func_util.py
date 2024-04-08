@@ -1,12 +1,30 @@
 """
 This module contains utility functions and classes that are used in the project.
 """
+import os
 import yaml
 import itertools
 import numpy as np
 from yaml.loader import SafeLoader
 from scipy.stats import norm
 from statsmodels.stats import inter_rater as irr
+
+def get_device_ids(cuda_devices):
+    """
+    Get the device ids from the cuda_devices.
+    :param cuda_devices: a string containing the device ids separated by comma. or 'all' for all available devices.
+    :return:
+    """
+    # set GPU device
+    if cuda_devices == 'all':
+        # set the GPU can be used
+        device_ids = [i for i in range(torch.cuda.device_count())]
+        cuda_devices = [str(i) for i in range(torch.cuda.device_count())]
+        os.environ["CUDA_VISIBLE_DEVICES"] = ','.join(cuda_devices)
+    else:
+        os.environ["CUDA_VISIBLE_DEVICES"] = cuda_devices
+        device_ids = [int(i) for i in cuda_devices.split(',')]
+    return device_ids
 
 def get_config(cfg_file):
     """
