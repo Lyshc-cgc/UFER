@@ -262,13 +262,14 @@ class Processor:
                 f.write(type_word_obj.word + '\n')
         print('Get type information done!')
 
-    def _prep_cand_type_words_for_stage2(self, candidate_type_words_nums=10, candidate_type_words_template=None):
+    def _prep_cand_type_words_for_stage2(self, candidate_type_words_nums=10, candidate_type_words_template=None, with_def=True):
         """
         Used before stage2.
         Prepare the candidate type words input to prompts.
 
         :param candidate_type_words_nums: The number of candidate type words with definitions input to prompts
         :param candidate_type_words_template: The template for candidate type words
+        :param with_def: Whether to include the definition of the type word
         :return:
         """
         # a Sequence to store all type information.
@@ -279,9 +280,13 @@ class Processor:
 
         batch_cand_type_words = []
         for batch_cad_ty_words in batched(candidate_type_words, candidate_type_words_nums):
-            # ['id': 0, 'word': x0, 'definition': xx', 'id': 1, 'word': x1, 'definition': xx']
-            # -> '<id>: 0, <word>: x0, <definition>: xx <id>: 1, <word>: x1, <definition>: xx'
-            tmp = [candidate_type_words_template.format(id=e['id'], word=e['word'], definition=e['definition']) for e in batch_cad_ty_words]
+            if with_def:  # with definitions
+                # [{'id': 0, 'word': x0, 'definition': xx'}, {'id': 1, 'word': x1, 'definition': xx'}]
+                # -> '<id>: 0, <word>: x0, <definition>: xx <id>: 1, <word>: x1, <definition>: xx'
+                tmp = [candidate_type_words_template['wd'].format(id=e['id'], word=e['word'], definition=e['definition']) for e in batch_cad_ty_words]
+            else:  # without definitions
+                # [{'id': 0, 'word': x0}, {'id': 1, 'word': x1}] -> '<id>: 0, <word>: x0 <id>: 1, <word>: x1'
+                tmp = [candidate_type_words_template['wod'].format(id=e['id'], word=e['word']) for e in batch_cad_ty_words]
             batch_cand_type_words.append('\n'.join(tmp))
         return candidate_type_words, batch_cand_type_words
 
@@ -577,7 +582,10 @@ class Processor:
             2) out_dir: The output directory.
             3) candidate_type_words: the candidate type words with definitions. Each element is a dict in a form of '{id: x, word: xx, definition: xxx}'
             4) batch_cand_type_words: the batched candidate type words. Each element is a string composed of a batch of candidate type words.
-            chat_message_templates: the chat message template for each annotating model
+            5) chat_message_templates: the chat message template for each annotating model
+            6) with_def: whether to include definitions of type words.
+            7) anno_models_wd: annotation model configs to include definitions of type words.
+            8) anno_models_wod: annotation model configs to exclude definitions of type words.
         :return:
         """
         # init wandb
@@ -627,7 +635,8 @@ class Processor:
                         yield sent_id, span_id, chat_message  # yield chat message, the ID of the sentences it contains and the ID of the entity mention it contains
 
         # 1. annotate entity type by multiple LLMs.
-        for anno_model_cfg in kwargs['anno_models']:
+        anno_model_cfgs = kwargs['anno_models_wd'] if kwargs['with_def'] else kwargs['anno_models_wod']
+        for anno_model_cfg in anno_model_cfgs:
             anno_model_name = anno_model_cfg['name']
             instances.update({f'{anno_model_name}_labels': []})  # store type words annotated by each annotating model
             instances.update({f'{anno_model_name}_label_ids': []})  # store type word ids  annotated by each annotating model
@@ -644,7 +653,10 @@ class Processor:
 
             # 1.2 Import the annotating model
             # https://docs.vllm.ai/en/latest/getting_started/quickstart.html
-            anno_model = LLM(model=anno_model_cfg['checkpoint'], tensor_parallel_size=gpu_num, dtype=anno_model_cfg['dtype'])
+            anno_model = LLM(model=anno_model_cfg['checkpoint'],
+                             tensor_parallel_size=gpu_num,
+                             dtype=anno_model_cfg['dtype'],
+                             gpu_memory_utilization=anno_model_cfg['gpu_memory_utilization'])
             sampling_params = SamplingParams(temperature=anno_model_cfg['anno_temperature'],
                                              top_p=anno_model_cfg['anno_top_p'],
                                              max_tokens=anno_model_cfg['anno_max_tokens'])
@@ -708,10 +720,11 @@ class Processor:
         # https://www.statsmodels.org/stable/generated/statsmodels.stats.inter_rater.aggregate_raters.html#
         # For evaluation on multi-label annotation, we cast multi-label (N types) into N binary-classification for each span.
         # And then, calculate the inter-annotator agreement (IAA). i.e., Fleiss' Kappa, Krippendorff's Alpha, etc.
-        num_anno_models = len(kwargs['anno_models'])
+        num_anno_models = len(anno_model_cfgs)
         eval_data = np.zeros((num_spans * self.type_num, num_anno_models), dtype=np.int8)
         span_id = -1  # the ID of the span
-        for model_id, anno_model_name in enumerate(kwargs['anno_models']):
+        for model_id, anno_model_cfg in enumerate(anno_model_cfgs):
+            anno_model_name = anno_model_cfg['name']
             for sent_spans_labels in instances[f'{anno_model_name}_label_ids']:  # e.g., sent_spans_labels=[[1,2], [3,4], [5,6]]
                 span_id += 1
                 for span_labels in sent_spans_labels:  # e.g., span_labels=[1,2]
@@ -754,18 +767,20 @@ class Processor:
 
             # prepare the candidate type words input to prompts
             candidate_type_words, batch_cand_type_words = self._prep_cand_type_words_for_stage2(stage_cfg['candidate_type_words_nums'],
-                                                                                     stage_cfg['candidate_type_words_template'])
+                                                                                     stage_cfg['candidate_type_words_template'],
+                                                                                                with_def=stage_cfg['with_def'])
             stage_cfg.update({'candidate_type_words': candidate_type_words})
             stage_cfg.update({'batch_cand_type_words': batch_cand_type_words})
 
             # init output dir and the chat messages for each annotation model
             stage_cfg.update({'chat_message_templates': dict()})  # store the chat message templates for the annotation models
-            for anno_model_cfg in stage_cfg['anno_models']:
+            anno_model_cfgs = stage_cfg['anno_models_wd'] if stage_cfg['with_def'] else stage_cfg['anno_models_wod']
+            for anno_model_cfg in anno_model_cfgs:
                 anno_model_name = anno_model_cfg['name']
                 out_dir_model = os.path.join(out_dir, anno_model_name)  # out_dir/mode/annt_model_name/
                 if not os.path.exists(out_dir_model):
                     os.makedirs(out_dir_model)
-                stage_cfg['chat_message_templates'][anno_model_name] = self._init_chat_message_for_stage2(anno_model_name, **stage_cfg[anno_model_name])
+                stage_cfg['chat_message_templates'][anno_model_name] = self._init_chat_message_for_stage2(anno_model_name, **anno_model_cfg)
 
         # 2. process each file in the given directory
         for path, dir_lst, file_lst in os.walk(in_dir):
@@ -839,7 +854,7 @@ def main():
     processor.get_type_info(type_info_file)
 
     # 4. stage2, annotate the given entity mention in the instances by multiple LLMs.
-    # processor.process('stage2')
+    processor.process('stage2')
 
 if __name__ == '__main__':
     main()
