@@ -20,96 +20,125 @@ auto_suggest: False  # whether to automatically search for alternative suggestio
 
 # 3. LLMs for getting the best definition for type words
 def_models:
-  -
-    name: Mistral
-    # https://huggingface.co/TheBloke/Mixtral-8x7B-Instruct-v0.1-GPTQ
-    checkpoint: ckpt/TheBloke/Mixtral-8x7B-Instruct-v0.1-GPTQ  # your path to the model checkpoint
-    def_template: >-
-      {id}: '{definition}'
-    usr_prompt: >-
-      You are a professional and helpful English linguist.
-      You are about to read some definitions of a word and determine which one is the most commonly used.
-      Here are some examples:
-      ### Start examples
-      1)
-      word: person
-      definitions:
-        0: 'An individual; usually a human being.'
-        1: 'The physical body of a being seen as distinct from the mind, character, etc.'
-        2: 'Any individual or formal organization with standing before the courts.'
-        3: 'The human genitalia; specifically, the penis.'
-        4: '(grammar) A linguistic category used to distinguish between the speaker of an utterance and those to whom or about whom he or she is speaking. See grammatical person.'
-        5: 'A shoot or bud of a plant; a polyp or zooid of the compound Hydrozoa, Anthozoa, etc.; also, an individual, in the narrowest sense, among the higher animals.'
-      output: 0
-
-      2)
-      word: organization
-      definitions:
-        0: 'The quality of being organized.'
-        1: 'The way in which something is organized, such as a book or an article.'
-        2: 'A group of people consciously cooperating.'
-        3: 'A group of people or other legal entities with an explicit purpose and written rules.'
-        4: 'A major league club and all its farm teams.'
-      output: 3
-
-      3)
-      word: car
-      definitions:
-        0: 'A wheeled vehicle, drawn by a horse or other animal; a chariot.'
-        1: 'An unpowered unit in a railroad train.'
-        2: 'An individual vehicle, powered or unpowered, in a multiple unit.'
-        3: 'A passenger-carrying unit in a subway or elevated train, whether powered or not.'
-        4: 'A wheeled vehicle that moves independently, with at least three wheels, powered mechanically, steered by a driver and mostly for personal transportation.'
-        5: 'A rough unit of quantity approximating the amount which would fill a railroad car.'
-        6: 'The moving, load-carrying component of an elevator or other cable-drawn transport mechanism.'
-        7: 'The passenger-carrying portion of certain amusement park rides, such as Ferris wheels.'
-        8: 'The part of an airship, such as a balloon or dirigible, which houses the passengers and control apparatus.'
-        9: 'A sliding fitting that runs along a track.'
-        10: 'The aggregate of desirable characteristics of a car.'
-        11: 'A floating perforated box for living fish.'
-      output: 4
-
-      4)
-      word: music
-      definitions:
-        0: 'A series of sounds organized in time, employing melody, harmony, tempo etc. usually to convey a mood.'
-        1: 'Any pleasing or interesting sounds.'
-        2: 'An art form, created by organizing of pitch, rhythm, and sounds made using musical instruments and sometimes singing.'
-        3: 'A guide to playing or singing a particular tune; sheet music.'
-        4: 'A passenger-carrying unit in a subway or elevated train, whether powered or not.'
-        5: 'Electronic signal jamming.'
-        6: 'Heated argument.'
-        7: 'Fun; amusement.'
-      output: 2
-      ### End examples
-      
-      Please directly output id of the most commonly used definition of the word. Other content is not allowed in the output.
-      Now, here is the query:
-      ### Start query
-      word: {word}
-      definitions:
-        {definitions}
-      output:
-
-    temperature: 0.1  # temperature for this model. We expect the judge model output deterministic results, so we set temperature to 0.1.
-    top_p: 0.5  # top_p for this model. The smaller the value, the more deterministic the model output is.
-    max_tokens: 3  # We only need to output 1 or 0, so we set max_tokens to 5.
-    bs: 24  # batch size for this model
-    dtype: float16  # https://docs.vllm.ai/en/latest/models/engine_args.html#cmdoption-dtype
-    def_res_cache_file: def_results.csv  # cache definition results file. Each def model will have a such file.
+#  -
+#    name: Mistral
+#    # https://huggingface.co/TheBloke/Mixtral-8x7B-Instruct-v0.1-GPTQ
+#    checkpoint: ckpt/TheBloke/Mixtral-8x7B-Instruct-v0.1-GPTQ  # your path to the model checkpoint
+#    def_template: >-
+#      {id}: '{definition}'
+#    usr_prompt: >-
+#      You are a professional and helpful English linguist.
+#      You need to explain the most commonly used meaning of a given word by performing the following actions:
+#      1) Read the provided definitions of the word carefully.
+#      2) Determine which two are the most commonly used.
+#      3) Summarize the definitions of the word as an output answer in one sentence based on your choice in step 2.
+#      Your output is a JSON string in the form of '{{"analysis": "your analysis process", "answer": "your answer"}}'.
+#      in the "analysis" field, you should describe your analysis process in a concise manner.
+#      In the "answer" field, you should output the definition summarized from your choice in one sentence.
+#
+#      Here are some examples:
+#      ### Start examples
+#      1)
+#      word: person
+#      definitions:
+#        0: 'An individual; usually a human being.'
+#        1: 'The physical body of a being seen as distinct from the mind, character, etc.'
+#        2: 'Any individual or formal organization with standing before the courts.'
+#        3: 'The human genitalia; specifically, the penis.'
+#        4: '(grammar) A linguistic category used to distinguish between the speaker of an utterance and those to whom or about whom he or she is speaking. See grammatical person.'
+#        5: 'A shoot or bud of a plant; a polyp or zooid of the compound Hydrozoa, Anthozoa, etc.; also, an individual, in the narrowest sense, among the higher animals.'
+#      output:
+#        {{
+#          "analysis": "First, I think the two most commonly used definitions of the word 'person' is 'An individual; usually a human being.' and 'The physical body of a being seen as distinct from the mind, character, etc.'. Then, I summarize them as 'an individual human being, encompassing both their physical body and their distinct mental and moral attributes.'",
+#          "answer": "an individual human being, encompassing both their physical body and their distinct mental and moral attributes."
+#          }}
+#
+#      2)
+#      word: organization
+#      definitions:
+#        0: 'The quality of being organized.'
+#        1: 'The way in which something is organized, such as a book or an article.'
+#        2: 'A group of people consciously cooperating.'
+#        3: 'A group of people or other legal entities with an explicit purpose and written rules.'
+#        4: 'A major league club and all its farm teams.'
+#      output:
+#        {{
+#          "analysis": "First, I think the two most commonly used definitions of the word 'organization' is 'The quality of being organized.' and 'A group of people or other legal entities with an explicit purpose and written rules.'. Then, I summarize them as 'the structured arrangement of components or activities and a collective entity, such as a group of individuals or legal bodies, operating with a defined objective and a set of established rules.'",
+#          "answer": "the structured arrangement of components or activities and a collective entity, such as a group of individuals or legal bodies, operating with a defined objective and a set of established rules."
+#          }}
+#
+#      3)
+#      word: car
+#      definitions:
+#        0: 'A wheeled vehicle, drawn by a horse or other animal; a chariot.'
+#        1: 'An unpowered unit in a railroad train.'
+#        2: 'An individual vehicle, powered or unpowered, in a multiple unit.'
+#        3: 'A passenger-carrying unit in a subway or elevated train, whether powered or not.'
+#        4: 'A wheeled vehicle that moves independently, with at least three wheels, powered mechanically, steered by a driver and mostly for personal transportation.'
+#        5: 'A rough unit of quantity approximating the amount which would fill a railroad car.'
+#        6: 'The moving, load-carrying component of an elevator or other cable-drawn transport mechanism.'
+#        7: 'The passenger-carrying portion of certain amusement park rides, such as Ferris wheels.'
+#        8: 'The part of an airship, such as a balloon or dirigible, which houses the passengers and control apparatus.'
+#        9: 'A sliding fitting that runs along a track.'
+#        10: 'The aggregate of desirable characteristics of a car.'
+#        11: 'A floating perforated box for living fish.'
+#      output:
+#      {{
+#        "analysis": "First, I think the two most commonly used definitions of the word 'car' is 'A wheeled vehicle, drawn by a horse or other animal; a chariot.' and 'A wheeled vehicle that moves independently, with at least three wheels, powered mechanically, steered by a driver and mostly for personal transportation.'. Then, I summarize them as 'a wheeled vehicle drawn by animals, but in modern usage, it predominantly denotes a self-propelled, mechanically powered vehicle with three or more wheels, designed for personal transportation and controlled by a driver.'",
+#        "answer": "a wheeled vehicle drawn by animals, but in modern usage, it predominantly denotes a self-propelled, mechanically powered vehicle with three or more wheels, designed for personal transportation and controlled by a driver."
+#        }}
+#
+#      4)
+#      word: music
+#      definitions:
+#        0: 'A series of sounds organized in time, employing melody, harmony, tempo etc. usually to convey a mood.'
+#        1: 'Any pleasing or interesting sounds.'
+#        2: 'An art form, created by organizing of pitch, rhythm, and sounds made using musical instruments and sometimes singing.'
+#        3: 'A guide to playing or singing a particular tune; sheet music.'
+#        4: 'A passenger-carrying unit in a subway or elevated train, whether powered or not.'
+#        5: 'Electronic signal jamming.'
+#        6: 'Heated argument.'
+#        7: 'Fun; amusement.'
+#      output:
+#        {{
+#          "analysis": "First, I think the two most commonly used definitions of the word 'music' is 'A series of sounds organized in time, employing melody, harmony, tempo etc. usually to convey a mood.' and 'An art form, created by organizing of pitch, rhythm, and sounds made using musical instruments and sometimes singing.'. Then, I summarize them as 'an art form characterized by the organized arrangement of sounds in time to express emotions or ideas, typically utilizing elements such as melody, harmony, tempo, pitch, and rhythm, created through the use of musical instruments and often incorporating vocal performance.'",
+#          "answer": "an art form characterized by the organized arrangement of sounds in time to express emotions or ideas, typically utilizing elements such as melody, harmony, tempo, pitch, and rhythm, created through the use of musical instruments and often incorporating vocal performance."
+#          }}
+#      ### End examples
+#
+#      Please directly output id of the most commonly used definition of the word. Other content is not allowed in the output.
+#      Now, here is the query:
+#      ### Start query
+#      word: {word}
+#      definitions:
+#        {definitions}
+#      output:
+#
+#    temperature: 0.1  # temperature for this model. We expect the judge model output deterministic results, so we set temperature to 0.1.
+#    top_p: 0.5  # top_p for this model. The smaller the value, the more deterministic the model output is.
+#    max_tokens: 200  # We only need to output 1 or 0, so we set max_tokens to 5.
+#    bs: 24  # batch size for this model
+#    dtype: float16  # https://docs.vllm.ai/en/latest/models/engine_args.html#cmdoption-dtype
+#    gpu_memory_utilization: 0.8  # the maximum percentage of GPU memory utilization
+#    def_res_cache_file: def_results.jsonl  # cache definition results file. Each def model will have a such file.
 
   -
     name: Qwen
-    # https://huggingface.co/Qwen/Qwen1.5-14B-Chat
-    checkpoint: ckpt/Qwen/Qwen1.5-14B-Chat  # your path to the model checkpoint
+    # https://huggingface.co/Qwen/Qwen1.5-32B-Chat-GPTQ-Int4
+    checkpoint: ckpt/Qwen/Qwen1.5-32B-Chat-GPTQ-Int4  # your path to the model checkpoint
     # qwen has system prompt. We can input the examples in a form of chatting
-    # https://huggingface.co/Qwen/Qwen1.5-14B-Chat#quickstart
+    # https://huggingface.co/Qwen1.5-32B-Chat-GPTQ-Int4#quickstart
     def_template: >-
       {id}: '{definition}'
     sys_prompt: >-
       You are a professional and helpful English linguist.
-      You are about to read some definitions of a word and determine which one is the most commonly used.
-      Please directly output id of the most commonly used definition of the word. Other content is not allowed in the output.
+      You need to explain the most commonly used meaning of a given word by performing the following actions:
+      1) Read the provided definitions of the word carefully.
+      2) Determine which two are the most commonly used.
+      3) Summarize the definitions of the word as an output answer in one sentence based on your choice in step 2.
+      Your output is a JSON string in the form of '{{"analysis": "your analysis process", "answer": "your answer"}}'.
+      in the "analysis" field, you should describe your analysis process in a concise manner.
+      In the "answer" field, you should output the definition summarized from your choice in one sentence.
 
     # the examples can be input in a form of chatting
     examples: # examples input in a form of chatting
@@ -121,7 +150,11 @@ def_models:
           3: 'The human genitalia; specifically, the penis.'
           4: '(grammar) A linguistic category used to distinguish between the speaker of an utterance and those to whom or about whom he or she is speaking. See grammatical person.'
           5: 'A shoot or bud of a plant; a polyp or zooid of the compound Hydrozoa, Anthozoa, etc.; also, an individual, in the narrowest sense, among the higher animals.'
-        output: 0
+        output: >-
+          {{
+            "analysis": "First, I think the two most commonly used definitions of the word 'person' is 'An individual; usually a human being.' and 'The physical body of a being seen as distinct from the mind, character, etc.'. Then, I summarize them as 'an individual human being, encompassing both their physical body and their distinct mental and moral attributes.'",
+            "answer": "an individual human being, encompassing both their physical body and their distinct mental and moral attributes."
+            }}
       - word: organization
         definitions: >-
           0: 'The quality of being organized.'
@@ -129,7 +162,11 @@ def_models:
           2: 'A group of people consciously cooperating.'
           3: 'A group of people or other legal entities with an explicit purpose and written rules.'
           4: 'A major league club and all its farm teams.'
-        output: 3
+        output: >-
+          {{
+            "analysis": "First, I think the two most commonly used definitions of the word 'organization' is 'The quality of being organized.' and 'A group of people or other legal entities with an explicit purpose and written rules.'. Then, I summarize them as 'the structured arrangement of components or activities and a collective entity, such as a group of individuals or legal bodies, operating with a defined objective and a set of established rules.'",
+            "answer": "the structured arrangement of components or activities and a collective entity, such as a group of individuals or legal bodies, operating with a defined objective and a set of established rules."
+            }}
       - word: car
         definitions: >-
           0: 'A wheeled vehicle, drawn by a horse or other animal; a chariot.'
@@ -144,7 +181,11 @@ def_models:
           9: 'A sliding fitting that runs along a track.'
           10: 'The aggregate of desirable characteristics of a car.'
           11: 'A floating perforated box for living fish.'
-        output: 4
+        output: >-
+          {{
+            "analysis": "First, I think the two most commonly used definitions of the word 'car' is 'A wheeled vehicle, drawn by a horse or other animal; a chariot.' and 'A wheeled vehicle that moves independently, with at least three wheels, powered mechanically, steered by a driver and mostly for personal transportation.'. Then, I summarize them as 'a wheeled vehicle drawn by animals, but in modern usage, it predominantly denotes a self-propelled, mechanically powered vehicle with three or more wheels, designed for personal transportation and controlled by a driver.'",
+            "answer": "a wheeled vehicle drawn by animals, but in modern usage, it predominantly denotes a self-propelled, mechanically powered vehicle with three or more wheels, designed for personal transportation and controlled by a driver."
+            }}
       - word: music
         definitions: >-
           0: 'A series of sounds organized in time, employing melody, harmony, tempo etc. usually to convey a mood.'
@@ -155,96 +196,126 @@ def_models:
           5: 'Electronic signal jamming.'
           6: 'Heated argument.'
           7: 'Fun; amusement.'
-        output: 2
+        output: >-
+          {{
+            "analysis": "First, I think the two most commonly used definitions of the word 'music' is 'A series of sounds organized in time, employing melody, harmony, tempo etc. usually to convey a mood.' and 'An art form, created by organizing of pitch, rhythm, and sounds made using musical instruments and sometimes singing.'. Then, I summarize them as 'an art form characterized by the organized arrangement of sounds in time to express emotions or ideas, typically utilizing elements such as melody, harmony, tempo, pitch, and rhythm, created through the use of musical instruments and often incorporating vocal performance.'",
+            "answer": "an art form characterized by the organized arrangement of sounds in time to express emotions or ideas, typically utilizing elements such as melody, harmony, tempo, pitch, and rhythm, created through the use of musical instruments and often incorporating vocal performance."
+            }}
     usr_prompt: >-
       word: {word}
       definitions:
         {definitions}
       output:
-    temperature: 0.1  # temperature for this model. We expect the judge model output deterministic results, so we set temperature to 0.1.
-    top_p: 0.6  # top_p for this model. The smaller the value, the more deterministic the model output is.
-    max_tokens: 3  # We only need to output 1 or 0, so we set max_tokens to 5.
-    bs: 24  # batch size for this model
-    dtype: float16  # https://docs.vllm.ai/en/latest/models/engine_args.html#cmdoption-dtype
-    def_res_cache_file: def_results.csv  # cache definition results file. Each def model will have a such file.
-
-  -
-    name: Yi
-    checkpoint: ckpt/01-ai/Yi-34B-Chat-8bits  # https://huggingface.co/01-ai/Yi-34B-Chat-8bits
-    # https://huggingface.co/01-ai/Yi-34B-Chat-8bits#perform-inference-with-yi-chat-model
-    def_template: >-
-      {id}: '{definition}'
-    usr_prompt: >-
-      You are a professional and helpful English linguist. 
-      You are about to read some definitions of a word and determine which one is the most commonly used.
-      Here are some examples:
-      ### Start examples
-      1)
-      word: person
-      definitions:
-        0: 'An individual; usually a human being.'
-        1: 'The physical body of a being seen as distinct from the mind, character, etc.'
-        2: 'Any individual or formal organization with standing before the courts.'
-        3: 'The human genitalia; specifically, the penis.'
-        4: '(grammar) A linguistic category used to distinguish between the speaker of an utterance and those to whom or about whom he or she is speaking. See grammatical person.'
-        5: 'A shoot or bud of a plant; a polyp or zooid of the compound Hydrozoa, Anthozoa, etc.; also, an individual, in the narrowest sense, among the higher animals.'
-      output: 0
-
-      2)
-      word: organization
-      definitions:
-        0: 'The quality of being organized.'
-        1: 'The way in which something is organized, such as a book or an article.'
-        2: 'A group of people consciously cooperating.'
-        3: 'A group of people or other legal entities with an explicit purpose and written rules.'
-        4: 'A major league club and all its farm teams.'
-      output: 3
-
-      3)
-      word: car
-      definitions:
-        0: 'A wheeled vehicle, drawn by a horse or other animal; a chariot.'
-        1: 'An unpowered unit in a railroad train.'
-        2: 'An individual vehicle, powered or unpowered, in a multiple unit.'
-        3: 'A passenger-carrying unit in a subway or elevated train, whether powered or not.'
-        4: 'A wheeled vehicle that moves independently, with at least three wheels, powered mechanically, steered by a driver and mostly for personal transportation.'
-        5: 'A rough unit of quantity approximating the amount which would fill a railroad car.'
-        6: 'The moving, load-carrying component of an elevator or other cable-drawn transport mechanism.'
-        7: 'The passenger-carrying portion of certain amusement park rides, such as Ferris wheels.'
-        8: 'The part of an airship, such as a balloon or dirigible, which houses the passengers and control apparatus.'
-        9: 'A sliding fitting that runs along a track.'
-        10: 'The aggregate of desirable characteristics of a car.'
-        11: 'A floating perforated box for living fish.'
-      output: 4
-
-      4)
-      word: music
-      definitions:
-        0: 'A series of sounds organized in time, employing melody, harmony, tempo etc. usually to convey a mood.'
-        1: 'Any pleasing or interesting sounds.'
-        2: 'An art form, created by organizing of pitch, rhythm, and sounds made using musical instruments and sometimes singing.'
-        3: 'A guide to playing or singing a particular tune; sheet music.'
-        4: 'A passenger-carrying unit in a subway or elevated train, whether powered or not.'
-        5: 'Electronic signal jamming.'
-        6: 'Heated argument.'
-        7: 'Fun; amusement.'
-      output: 2
-      ### End examples
-
-      Please directly output id of the most commonly used definition of the word. Other content is not allowed in the output.
-      Now, here is the query: 
-      ### Start query
-      word: {word}
-      definitions:
-        {definitions}
-      output:
-
     temperature: 0.1  # temperature for this model. We expect the judge model output deterministic results, so we set temperature to 0.1.
     top_p: 0.5  # top_p for this model. The smaller the value, the more deterministic the model output is.
-    max_tokens: 3  # We only need to output 1 or 0, so we set max_tokens to 5.
-    bs: 16  # batch size for this model
+    max_tokens: 400  # We only need to output 1 or 0, so we set max_tokens to 5.
+    bs: 24  # batch size for this model
     dtype: float16  # https://docs.vllm.ai/en/latest/models/engine_args.html#cmdoption-dtype
-    def_res_cache_file: def_results.csv  # cache definition results file. Each def model will have a such file.
+    gpu_memory_utilization: 0.8  # the maximum percentage of GPU memory utilization
+    def_res_cache_file: def_results.jsonl  # cache definition results file. Each def model will have a such file.
+
+#  -
+#    name: Yi
+#    checkpoint: ckpt/01-ai/Yi-34B-Chat-8bits  # https://huggingface.co/01-ai/Yi-34B-Chat-8bits
+#    # https://huggingface.co/01-ai/Yi-34B-Chat-8bits#perform-inference-with-yi-chat-model
+#    def_template: >-
+#      {id}: '{definition}'
+#    usr_prompt: >-
+#      You are a professional and helpful English linguist.
+#      You need to explain the most commonly used meaning of a given word by performing the following actions:
+#      1) Read the provided definitions of the word carefully.
+#      2) Determine which two are the most commonly used.
+#      3) Summarize the definitions of the word as an output answer in one sentence based on your choice in step 2.
+#      Your output is a JSON string in the form of '{{"analysis": "your analysis process", "answer": "your answer"}}'.
+#      in the "analysis" field, you should describe your analysis process in a concise manner.
+#      In the "answer" field, you should output the definition summarized from your choice in one sentence.
+#
+#      Here are some examples:
+#      ### Start examples
+#      1)
+#      word: person
+#      definitions:
+#        0: 'An individual; usually a human being.'
+#        1: 'The physical body of a being seen as distinct from the mind, character, etc.'
+#        2: 'Any individual or formal organization with standing before the courts.'
+#        3: 'The human genitalia; specifically, the penis.'
+#        4: '(grammar) A linguistic category used to distinguish between the speaker of an utterance and those to whom or about whom he or she is speaking. See grammatical person.'
+#        5: 'A shoot or bud of a plant; a polyp or zooid of the compound Hydrozoa, Anthozoa, etc.; also, an individual, in the narrowest sense, among the higher animals.'
+#      output:
+#        {{
+#          "analysis": "First, I think the two most commonly used definitions of the word 'person' is 'An individual; usually a human being.' and 'The physical body of a being seen as distinct from the mind, character, etc.'. Then, I summarize them as 'an individual human being, encompassing both their physical body and their distinct mental and moral attributes.'",
+#          "answer": "an individual human being, encompassing both their physical body and their distinct mental and moral attributes."
+#          }}
+#
+#      2)
+#      word: organization
+#      definitions:
+#        0: 'The quality of being organized.'
+#        1: 'The way in which something is organized, such as a book or an article.'
+#        2: 'A group of people consciously cooperating.'
+#        3: 'A group of people or other legal entities with an explicit purpose and written rules.'
+#        4: 'A major league club and all its farm teams.'
+#      output:
+#        {{
+#          "analysis": "First, I think the two most commonly used definitions of the word 'organization' is 'The quality of being organized.' and 'A group of people or other legal entities with an explicit purpose and written rules.'. Then, I summarize them as 'the structured arrangement of components or activities and a collective entity, such as a group of individuals or legal bodies, operating with a defined objective and a set of established rules.'",
+#          "answer": "the structured arrangement of components or activities and a collective entity, such as a group of individuals or legal bodies, operating with a defined objective and a set of established rules."
+#          }}
+#
+#      3)
+#      word: car
+#      definitions:
+#        0: 'A wheeled vehicle, drawn by a horse or other animal; a chariot.'
+#        1: 'An unpowered unit in a railroad train.'
+#        2: 'An individual vehicle, powered or unpowered, in a multiple unit.'
+#        3: 'A passenger-carrying unit in a subway or elevated train, whether powered or not.'
+#        4: 'A wheeled vehicle that moves independently, with at least three wheels, powered mechanically, steered by a driver and mostly for personal transportation.'
+#        5: 'A rough unit of quantity approximating the amount which would fill a railroad car.'
+#        6: 'The moving, load-carrying component of an elevator or other cable-drawn transport mechanism.'
+#        7: 'The passenger-carrying portion of certain amusement park rides, such as Ferris wheels.'
+#        8: 'The part of an airship, such as a balloon or dirigible, which houses the passengers and control apparatus.'
+#        9: 'A sliding fitting that runs along a track.'
+#        10: 'The aggregate of desirable characteristics of a car.'
+#        11: 'A floating perforated box for living fish.'
+#      output:
+#      {{
+#        "analysis": "First, I think the two most commonly used definitions of the word 'car' is 'A wheeled vehicle, drawn by a horse or other animal; a chariot.' and 'A wheeled vehicle that moves independently, with at least three wheels, powered mechanically, steered by a driver and mostly for personal transportation.'. Then, I summarize them as 'a wheeled vehicle drawn by animals, but in modern usage, it predominantly denotes a self-propelled, mechanically powered vehicle with three or more wheels, designed for personal transportation and controlled by a driver.'",
+#        "answer": "a wheeled vehicle drawn by animals, but in modern usage, it predominantly denotes a self-propelled, mechanically powered vehicle with three or more wheels, designed for personal transportation and controlled by a driver."
+#        }}
+#
+#      4)
+#      word: music
+#      definitions:
+#        0: 'A series of sounds organized in time, employing melody, harmony, tempo etc. usually to convey a mood.'
+#        1: 'Any pleasing or interesting sounds.'
+#        2: 'An art form, created by organizing of pitch, rhythm, and sounds made using musical instruments and sometimes singing.'
+#        3: 'A guide to playing or singing a particular tune; sheet music.'
+#        4: 'A passenger-carrying unit in a subway or elevated train, whether powered or not.'
+#        5: 'Electronic signal jamming.'
+#        6: 'Heated argument.'
+#        7: 'Fun; amusement.'
+#      output:
+#        {{
+#          "analysis": "First, I think the two most commonly used definitions of the word 'music' is 'A series of sounds organized in time, employing melody, harmony, tempo etc. usually to convey a mood.' and 'An art form, created by organizing of pitch, rhythm, and sounds made using musical instruments and sometimes singing.'. Then, I summarize them as 'an art form characterized by the organized arrangement of sounds in time to express emotions or ideas, typically utilizing elements such as melody, harmony, tempo, pitch, and rhythm, created through the use of musical instruments and often incorporating vocal performance.'",
+#          "answer": "an art form characterized by the organized arrangement of sounds in time to express emotions or ideas, typically utilizing elements such as melody, harmony, tempo, pitch, and rhythm, created through the use of musical instruments and often incorporating vocal performance."
+#          }}
+#      ### End examples
+#
+#      Please directly output id of the most commonly used definition of the word. Other content is not allowed in the output.
+#      Now, here is the query:
+#      ### Start query
+#      word: {word}
+#      definitions:
+#        {definitions}
+#      output:
+#
+#    temperature: 0.1  # temperature for this model. We expect the judge model output deterministic results, so we set temperature to 0.1.
+#    top_p: 0.5  # top_p for this model. The smaller the value, the more deterministic the model output is.
+#    max_tokens: 200  # We only need to output 1 or 0, so we set max_tokens to 5.
+#    bs: 16  # batch size for this model
+#    dtype: float16  # https://docs.vllm.ai/en/latest/models/engine_args.html#cmdoption-dtype
+#    gpu_memory_utilization: 0.8  # the maximum percentage of GPU memory utilization
+#    def_res_cache_file: def_results.csv  # cache definition results file. Each def model will have a such file.
+
   # - add more
   # you can add more models in the future in a form of the configs like above
   # all keys in the configs are required!

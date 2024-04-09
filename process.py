@@ -670,7 +670,7 @@ class Processor:
             pbar = tqdm(batched(_generate_chat_messages(instances, anno_model_name), anno_model_cfg['anno_bs']),
                         desc=f'annotating shards {shard_idx}/{num_shards}')
             num_spans = 0  # store the number of spans in the dataset shard
-            json_pattern = r'\{.*?\}'  # the pattern to extract JSON string
+            json_pattern = r'\{\{(.*?)\}\}'  # the pattern to extract JSON string
             for batch in pbar:  # batch is a tuple like ((sent_id_0, span_id_0, chat_0),(sent_id_1, span_id_1, chat_1)...)
                 batch_sent_ids, batch_span_ids, batch_chats = [], [], []
                 for sent_id, span_id, chat in batch:
@@ -688,8 +688,9 @@ class Processor:
                 for sent_id, span_id, output in zip(batch_sent_ids, batch_span_ids, outputs):
                     # extract JSON string from output.outputs[0].text
                     # out_answer is a string like '2782, 2783, 2788'
-                    results = re.findall(json_pattern, output.outputs[0].text, re.DOTALL)[0]  # only extract the first JSON string
-                    out_answer = json.loads(results)['answer']
+                    result = re.findall(json_pattern, output.outputs[0].text, re.DOTALL)[0]  # only extract the first JSON string
+                    # todo, json.loads() is not safe, we should use a safer way to extract JSON string or use try catch
+                    out_answer = json.loads('{' + result + '}')['answer']
                     out_answer = out_answer.strip().split(',')
                     if len(out_answer) == 1 and int(out_answer[0]) == -1:
                         # if the model cannot find a suitable type word in this batch of candidate type words,
@@ -854,7 +855,7 @@ def main():
     processor.get_type_info(type_info_file)
 
     # 4. stage2, annotate the given entity mention in the instances by multiple LLMs.
-    processor.process('stage2')
+    # processor.process('stage2')
 
 if __name__ == '__main__':
     main()

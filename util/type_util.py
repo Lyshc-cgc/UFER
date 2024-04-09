@@ -192,7 +192,7 @@ def get_defi_by_llm(in_file, device_ids, **def_model_cfg):
         with jsonlines.open(in_file) as reader:
             for line in reader:
                 type_word = TypeWord(**line)
-                if len(type_word.definitions) == 1:  # skip the type words with only one definition
+                if len(type_word.definitions) <= 2:  # skip the type words with only one/two definitions
                     continue
                 chat_msg = copy.deepcopy(chat_msg_template)
                 defis = []
@@ -213,11 +213,14 @@ def get_defi_by_llm(in_file, device_ids, **def_model_cfg):
             chat_msg_template.append({"role": "user", "content": usr_content})
             chat_msg_template.append({"role": "assistant", "content": str(example['output'])})
     else:
-        # e.g., for mistral and Yi, we only need to input the user's prompt
+        # e.g., for Mistral and Yi, we only need to input the user's prompt
         chat_msg_template = []
 
     # 2. init llm and its tokenizer
-    def_model = LLM(model=def_model_cfg['checkpoint'], tensor_parallel_size=len(device_ids), dtype=def_model_cfg['dtype'])
+    def_model = LLM(model=def_model_cfg['checkpoint'],
+                    tensor_parallel_size=len(device_ids),
+                    dtype=def_model_cfg['dtype'],
+                    gpu_memory_utilization=def_model_cfg['gpu_memory_utilization'])
     # get its tokenizer to apply the chat template
     # https://github.com/vllm-project/vllm/issues/3119
     tokenizer = def_model.llm_engine.tokenizer.tokenizer
@@ -228,20 +231,24 @@ def get_defi_by_llm(in_file, device_ids, **def_model_cfg):
     pbar = tqdm(batched(_generate_chat_messages(in_file, chat_msg_template, **def_model_cfg),
                         def_model_cfg['bs']),
                 desc=f"get best definition by {def_model_cfg['name']}", )
-    pattern = r'\d+'  # pattern to match the number in the output
+    json_pattern = r'\{\{(.*?)\}\}'  # the pattern to extract JSON string
     each_results = []  # store the judge result by each llm
     for batch_chats in pbar:
         # we should use tokenizer.apply_chat_template to add generation template to the chats explicitly
         templated_batch_chats = tokenizer.apply_chat_template(batch_chats, add_generation_prompt=True, tokenize=False)
         outputs = def_model.generate(templated_batch_chats, sampling_params)
         for out_id, output in enumerate(outputs):
-            answer = output.outputs[0].text
-            if not (result := re.search(pattern, answer)):  # there is not a number in this output
-                result = 0  # we set default to 0, the first definition is the best definition
+            # only extract the first JSON string
+            result = re.findall(json_pattern, output.outputs[0].text, re.DOTALL)
+            if result and len(result) >= 1:
+                try:
+                    each_results.append(json.loads('{' + result[0] + '}'))
+                except json.JSONDecodeError:
+                    print('{' + result[0] + '}')
+                    each_results.append({"analysis": None, "answer": None})
             else:
-                # Yeah! We got the answer we needed
-                result = int(result.group())
-            each_results.append(result)
+                print(output.outputs[0].text)
+                each_results.append({"analysis": None, "answer": None})
     return each_results
 
 def get_best_definition(in_file, out_file, cuda_devices, **kwargs):
@@ -274,9 +281,10 @@ def get_best_definition(in_file, out_file, cuda_devices, **kwargs):
         cache_file_name = def_model_cfg['def_res_cache_file']
         def_res_cache_file = os.path.join(model_work_dir, cache_file_name)  # the file to cache the results from all def models
 
-        if os.path.exists(def_res_cache_file):  # read the cache file directly
-            cache_res = pd.read_csv(def_res_cache_file)
-            results.append(cache_res.iloc[:, 1].tolist())
+        if def_res_cache_file.endswith('.jsonl') and os.path.exists(def_res_cache_file):  # read the cache file directly
+            with jsonlines.open(def_res_cache_file, 'r') as reader:
+                cache_res = [line for line in reader]
+            results.append(cache_res)
             continue
 
         # else we should get the best definition by this LLM from scratch
@@ -287,28 +295,29 @@ def get_best_definition(in_file, out_file, cuda_devices, **kwargs):
         # 1.3 cache the result by each llm
         if not os.path.exists(model_work_dir):
             os.makedirs(model_work_dir)
-        pd.DataFrame(each_results, columns=['result']).to_csv(def_res_cache_file, index_label='id')
+        with jsonlines.open(def_res_cache_file, 'w') as writer:
+            for res in each_results:
+                writer.write(res)
 
-    # 2. get the best definition for each type words by voting
-    results = np.array(results).T  # after transpose, each row of the results indicates represents the judgement results from different models for the definition of a type word.
-    best_def_idxs= []
-    for row in results:
-        best_def = Counter(row).most_common(1)[0]
-        best_def_idxs.append(best_def[0])  # best_def[0] is the index of the best definition, best_def[1] is the vote number
-
+    # 2. output
     with jsonlines.open(in_file, 'r') as reader, jsonlines.open(out_file, 'w') as writer:
-        idx = 0  # index for those type words with multiple definitions
+        idx = 0  # index for those type words with multiple definitions (> 2)
         for line in reader:
-            if len(line['definitions']) == 1:  # For those type words with only one definition, copy directly
+            if len(line['definitions']) <= 2:
+                # For those type words with only one/two definition
+                # copy the first definition directly
                 line['definition'] = line['definitions'][0]
-            else:  # For those type words with multiple definitions, we should get the best definition by voting
-                best_def_idx = best_def_idxs[idx]
-                # if best_def_idx >= len(line['definitions']):  # wrong best_def_idx
-                #     print(f"id: {line['id']}, word: {line['word']}, best_def_idx: {best_def_idx}, len(definitions): {len(line['definitions'])}")
-                #     continue
-                line['definition'] = line['definitions'][best_def_idx]
+            else:
+                if not results[0][idx]:
+                    # No correct answer generated by LLMs
+                    # copy the first definition directly
+                    line['definition'] = line['definitions'][0]
+                else:  # For those type words with multiple definitions, we should get the best definition by voting
+                    line['definition'] = results[0][idx]['answer']
+                idx += 1
             del line['definitions']
             writer.write(line)
+
 
 def judge_by_llm(work_dir, clusters, device_ids, **kwargs):
     """
