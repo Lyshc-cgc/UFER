@@ -192,7 +192,7 @@ def get_defi_by_llm(in_file, device_ids, **def_model_cfg):
         with jsonlines.open(in_file) as reader:
             for line in reader:
                 type_word = TypeWord(**line)
-                if len(type_word.definitions) <= 2:  # skip the type words with only one/two definitions
+                if len(type_word.definitions) <= 1:  # skip the type words with only one definition
                     continue
                 chat_msg = copy.deepcopy(chat_msg_template)
                 defis = []
@@ -303,8 +303,8 @@ def get_best_definition(in_file, out_file, cuda_devices, **kwargs):
     with jsonlines.open(in_file, 'r') as reader, jsonlines.open(out_file, 'w') as writer:
         idx = 0  # index for those type words with multiple definitions (> 2)
         for line in reader:
-            if len(line['definitions']) <= 2:
-                # For those type words with only one/two definition
+            if len(line['definitions']) <= 1:
+                # For those type words with only two definition
                 # copy the first definition directly
                 line['definition'] = line['definitions'][0]
             else:

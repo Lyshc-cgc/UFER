@@ -134,7 +134,9 @@ def_models:
       You are a professional and helpful English linguist.
       You need to explain the most commonly used meaning of a given word by performing the following actions:
       1) Read the provided definitions of the word carefully.
-      2) Determine which two are the most commonly used.
+      2) Determine which two are the most commonly used. 
+      If there are exactly two definitions, you can directly choose both of them.
+      If there are more than two definitions, you need to select the two most commonly used definitions.
       3) Summarize the definitions of the word as an output answer in one sentence based on your choice in step 2.
       Your output is a JSON string in the form of '{{"analysis": "your analysis process", "answer": "your answer"}}'.
       in the "analysis" field, you should describe your analysis process in a concise manner.
@@ -186,20 +188,14 @@ def_models:
             "analysis": "First, I think the two most commonly used definitions of the word 'car' is 'A wheeled vehicle, drawn by a horse or other animal; a chariot.' and 'A wheeled vehicle that moves independently, with at least three wheels, powered mechanically, steered by a driver and mostly for personal transportation.'. Then, I summarize them as 'a wheeled vehicle drawn by animals, but in modern usage, it predominantly denotes a self-propelled, mechanically powered vehicle with three or more wheels, designed for personal transportation and controlled by a driver.'",
             "answer": "a wheeled vehicle drawn by animals, but in modern usage, it predominantly denotes a self-propelled, mechanically powered vehicle with three or more wheels, designed for personal transportation and controlled by a driver."
             }}
-      - word: music
+      - word: building
         definitions: >-
-          0: 'A series of sounds organized in time, employing melody, harmony, tempo etc. usually to convey a mood.'
-          1: 'Any pleasing or interesting sounds.'
-          2: 'An art form, created by organizing of pitch, rhythm, and sounds made using musical instruments and sometimes singing.'
-          3: 'A guide to playing or singing a particular tune; sheet music.'
-          4: 'A passenger-carrying unit in a subway or elevated train, whether powered or not.'
-          5: 'Electronic signal jamming.'
-          6: 'Heated argument.'
-          7: 'Fun; amusement.'
+          0: 'The act or process by which something is built; construction.'
+          1: 'A closed structure with walls and a roof.'
         output: >-
           {{
-            "analysis": "First, I think the two most commonly used definitions of the word 'music' is 'A series of sounds organized in time, employing melody, harmony, tempo etc. usually to convey a mood.' and 'An art form, created by organizing of pitch, rhythm, and sounds made using musical instruments and sometimes singing.'. Then, I summarize them as 'an art form characterized by the organized arrangement of sounds in time to express emotions or ideas, typically utilizing elements such as melody, harmony, tempo, pitch, and rhythm, created through the use of musical instruments and often incorporating vocal performance.'",
-            "answer": "an art form characterized by the organized arrangement of sounds in time to express emotions or ideas, typically utilizing elements such as melody, harmony, tempo, pitch, and rhythm, created through the use of musical instruments and often incorporating vocal performance."
+            "analysis": "First, there are exactly 2 definition for the word 'building', so I directly choose both of them. Then, I summarize them as 'the construction process of creating a structure or a physical structure with walls and a roof that encloses a space.'",
+            "answer": "the construction process of creating a structure or a physical structure with walls and a roof that encloses a space."
             }}
     usr_prompt: >-
       word: {word}

@@ -656,10 +656,12 @@ class Processor:
             anno_model = LLM(model=anno_model_cfg['checkpoint'],
                              tensor_parallel_size=gpu_num,
                              dtype=anno_model_cfg['dtype'],
-                             gpu_memory_utilization=anno_model_cfg['gpu_memory_utilization'])
+                             gpu_memory_utilization=anno_model_cfg['gpu_memory_utilization'],
+                             trust_remote_code=True)
             sampling_params = SamplingParams(temperature=anno_model_cfg['anno_temperature'],
                                              top_p=anno_model_cfg['anno_top_p'],
-                                             max_tokens=anno_model_cfg['anno_max_tokens'])
+                                             max_tokens=anno_model_cfg['anno_max_tokens'],
+                                             repetition_penalty=anno_model_cfg['repetition_penalty'])
 
             # get anno_model's tokenizer to apply the chat template
             # https://github.com/vllm-project/vllm/issues/3119
@@ -688,14 +690,24 @@ class Processor:
                 for sent_id, span_id, output in zip(batch_sent_ids, batch_span_ids, outputs):
                     # extract JSON string from output.outputs[0].text
                     # out_answer is a string like '2782, 2783, 2788'
-                    result = re.findall(json_pattern, output.outputs[0].text, re.DOTALL)[0]  # only extract the first JSON string
-                    # todo, json.loads() is not safe, we should use a safer way to extract JSON string or use try catch
-                    out_answer = json.loads('{' + result + '}')['answer']
-                    out_answer = out_answer.strip().split(',')
-                    if len(out_answer) == 1 and int(out_answer[0]) == -1:
+                    result = re.findall(json_pattern, output.outputs[0].text, re.DOTALL)
+                    if result and len(result) >= 1:  # only extract the first JSON string
+                        try:
+                            # todo, json.loads() is not safe, we should use a safer way to extract JSON string or use try catch
+                            out_answer = json.loads('{' + result[0]  + '}')['answer']
+                            out_answer = out_answer.strip().split(',')
+                            out_answer = [e.strip() for e in out_answer]
+                        except json.JSONDecodeError:
+                            out_answer = ['None']  # we assign 'None' to out_answer if we cannot extract the JSON string, so that we can continue the loop
+                    else:
+                        out_answer = ['None']  # we assign'None' to out_answer if we cannot extract the JSON string, so that we can continue the loop
+
+                    # check the answers
+                    if len(out_answer) == 1 and out_answer[0] == 'None':
                         # if the model cannot find a suitable type word in this batch of candidate type words,
-                        # we should continue
+                        # we should continue the loop
                         continue
+
                     labels, label_ids = [], []
                     for e in out_answer:
                         type_word = kwargs['candidate_type_words'][int(e)]
@@ -855,7 +867,7 @@ def main():
     processor.get_type_info(type_info_file)
 
     # 4. stage2, annotate the given entity mention in the instances by multiple LLMs.
-    # processor.process('stage2')
+    processor.process('stage2')
 
 if __name__ == '__main__':
     main()
